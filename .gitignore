@@ -1,0 +1,17 @@
+# --- Backend (Python) ---
+open-venture-agent-backend/venv/
+open-venture-agent-backend/__pycache__/
+open-venture-agent-backend/*.pyc
+open-venture-agent-backend/.env
+open-venture-agent-backend/.cursorrules
+
+# --- Frontend (Node) ---
+open-venture-agent-frontend/node_modules/
+open-venture-agent-frontend/.env
+open-venture-agent-frontend/dist/
+open-venture-agent-frontend/build/
+open-venture-agent-frontend/.next/
+
+# --- General ---
+.DS_Store
+*.log
