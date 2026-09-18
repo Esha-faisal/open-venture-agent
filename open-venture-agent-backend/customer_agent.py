@@ -53,6 +53,7 @@ class CustomerExtraction(BaseModel):
 
 class CustomerState(TypedDict, total=False):
     business_idea: str
+    delivery_mode: str | None
     reviews_query: str
     needs_query: str
     reviews_search_results: str
@@ -71,7 +72,19 @@ def _customer_confidence(source_count: int) -> Literal["strong", "weak", "none"]
     return "none"
 
 
-def _default_no_local_reason(location_label: str) -> str:
+_REMOTE_NO_CUSTOMER_REASON = (
+    "Searched for general customer feedback about this type of product "
+    "rather than local reviews; little usable customer voice turned up."
+)
+
+
+def _default_no_local_reason(
+    location_label: str | None,
+    *,
+    delivery_mode: str | None = None,
+) -> str:
+    if (delivery_mode or "").lower() == "remote" or not location_label:
+        return _REMOTE_NO_CUSTOMER_REASON
     return (
         f"No customer reviews or discussions specific to {location_label} were "
         "found in search results; only generic/non-local content was available."
@@ -154,27 +167,49 @@ def extract_customer_insights(state: CustomerState) -> dict:
     structured_llm = llm.with_structured_output(CustomerExtraction)
 
     _, location = _parse_business_idea(state["business_idea"])
-    location_hint = location or "the stated location in the business idea"
+    delivery_mode = (state.get("delivery_mode") or "").lower() or None
+    is_remote = delivery_mode == "remote" or not location
+
+    if is_remote:
+        location_hint = "general / non-local product or service feedback"
+        gate_block = (
+            "EVIDENCE GATE (remote / no specific place named):\n"
+            "- Prefer customer reviews, complaints, and needs about this type of "
+            "product or service in general — not a specific city.\n"
+            "- Extract segments and pain points only when the source clearly "
+            "discusses buyers of this kind of offering.\n"
+            "- When ZERO usable items are found, return empty lists and set "
+            "no_local_data_reason to a short honest sentence like: "
+            f"\"{_REMOTE_NO_CUSTOMER_REASON}\"\n"
+            "- Do NOT say \"the stated location\" or invent a city.\n"
+            "- When at least one item is usable, leave no_local_data_reason null.\n\n"
+        )
+    else:
+        location_hint = location
+        gate_block = (
+            "LOCAL EVIDENCE GATE — mandatory:\n"
+            f"- The target location is: {location_hint}.\n"
+            "- ONLY extract a pain_point or customer_segment if the supporting source "
+            "explicitly mentions this location (city/neighborhood/area name) OR clear "
+            "local context (a named local business, local landmark, local market, or "
+            "clearly area-specific forum/review thread).\n"
+            "- If a result is only topically related (generic 'how to start a grocery "
+            "store', national industry blogs, US/UK lifestyle articles, worldwide "
+            "buyer personas) and does NOT name the actual area or local context, "
+            "DO NOT extract it — and do not emit a segment/pain point whose only "
+            "purpose is to explain that the source was irrelevant or off-location.\n"
+            "- When ZERO items pass this gate, return empty customer_segments and "
+            "empty customer_pain_points, set no_local_data_reason to a short honest "
+            "sentence like: \"No customer reviews or discussions specific to "
+            f"{location_hint} were found in search results; only generic/non-local "
+            "content was available.\", and do not invent fillers.\n"
+            "- When at least one item is local, leave no_local_data_reason null.\n\n"
+        )
 
     prompt = (
         "You are a customer-research analyst. From the search results below, extract "
         "customer segments and pain points for this business idea.\n\n"
-        "LOCAL EVIDENCE GATE — mandatory:\n"
-        f"- The target location is: {location_hint}.\n"
-        "- ONLY extract a pain_point or customer_segment if the supporting source "
-        "explicitly mentions this location (city/neighborhood/area name) OR clear "
-        "local context (a named local business, local landmark, local market, or "
-        "clearly area-specific forum/review thread).\n"
-        "- If a result is only topically related (generic 'how to start a grocery "
-        "store', national industry blogs, US/UK lifestyle articles, worldwide "
-        "buyer personas) and does NOT name the actual area or local context, "
-        "DO NOT extract it.\n"
-        "- When ZERO items pass this gate, return empty customer_segments and "
-        "empty customer_pain_points, set no_local_data_reason to a short honest "
-        "sentence like: \"No customer reviews or discussions specific to "
-        f"{location_hint} were found in search results; only generic/non-local "
-        "content was available.\", and do not invent fillers.\n"
-        "- When at least one item is local, leave no_local_data_reason null.\n\n"
+        f"{gate_block}"
         "OTHER RULES:\n"
         "- ONLY extract segments and pain points clearly backed by the search "
         "results (reviews, complaints, forums, local articles, customer comments).\n"
@@ -183,10 +218,11 @@ def extract_customer_insights(state: CustomerState) -> dict:
         "- Every pain point must include a source URL from the results.\n"
         "- Do NOT invent generic personas such as 'young professionals', 'families', "
         "or 'middle-class buyers' unless the search results explicitly support them "
-        "with local evidence.\n"
+        "with evidence.\n"
         "- needs must be specific and grounded in the evidence, not marketing "
         "boilerplate.\n\n"
         f"Business idea: {state['business_idea']}\n"
+        f"Delivery mode: {delivery_mode or 'unknown'}\n"
         f"Reviews query: {state.get('reviews_query', '')}\n"
         f"Needs query: {state.get('needs_query', '')}\n\n"
         f"Reviews / complaints search results:\n{state.get('reviews_search_results', '')}\n\n"
@@ -214,8 +250,14 @@ def extract_customer_insights(state: CustomerState) -> dict:
 
     if not segments and not pain_points:
         reason = (result.no_local_data_reason or "").strip() or _default_no_local_reason(
-            location_hint
+            location,
+            delivery_mode=delivery_mode,
         )
+        if is_remote and (
+            "stated location" in reason.lower()
+            or (location is None and "specific to" in reason.lower())
+        ):
+            reason = _REMOTE_NO_CUSTOMER_REASON
         return {
             "customer_segments": [],
             "customer_pain_points": [],
@@ -252,8 +294,17 @@ def build_customer_graph():
 customer_agent = build_customer_graph()
 
 
-def run_customer_research(business_idea: str) -> dict:
-    result = customer_agent.invoke({"business_idea": business_idea})
+def run_customer_research(
+    business_idea: str,
+    *,
+    delivery_mode: str | None = None,
+) -> dict:
+    result = customer_agent.invoke(
+        {
+            "business_idea": business_idea,
+            "delivery_mode": delivery_mode,
+        }
+    )
     return {
         "customer_segments": result.get("customer_segments") or [],
         "customer_pain_points": result.get("customer_pain_points") or [],

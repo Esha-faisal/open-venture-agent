@@ -62,6 +62,23 @@ class AssumptionValidationList(BaseModel):
     tasks: list[AssumptionValidationDraft]
 
 
+class VerificationTaskDraft(BaseModel):
+    verification_index: int = Field(
+        description="0-based index into the verification_needed list"
+    )
+    title: str = Field(
+        description=(
+            "Concrete, actionable VALIDATE task (verb-led). Must read differently "
+            "from the risk statement — turn the concern into a real-world check, "
+            "do not copy the risk text."
+        )
+    )
+
+
+class VerificationTaskList(BaseModel):
+    tasks: list[VerificationTaskDraft]
+
+
 def _next_task_id(counter: list[int]) -> str:
     task_id = f"T{counter[0]}"
     counter[0] += 1
@@ -158,6 +175,64 @@ def _build_tasks_from_differentiators(
     return drafts
 
 
+def _validation_titles_from_verification_needed(
+    verification_items: list[str],
+) -> list[str]:
+    """Turn risk statements into distinct actionable Validate task titles."""
+    if not verification_items:
+        return []
+
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
+    structured_llm = llm.with_structured_output(VerificationTaskList)
+
+    prompt = (
+        "Convert each VERIFICATION / RISK statement into exactly one concrete "
+        "VALIDATE task title.\n"
+        "The inputs are pure risk or discrepancy statements (what is uncertain). "
+        "They are NOT tasks. Do NOT copy or lightly rephrase them as the title.\n"
+        "Rules:\n"
+        "- Produce one task per item (same count; use verification_index).\n"
+        "- title must be an executable ACTION that starts with a verb "
+        "(Walk, Visit, Call, Count, Survey, Interview, Compare, Map, Time, "
+        "Document, Ask, Photograph, etc.).\n"
+        "- Make it specific: who/what/where/how when possible.\n"
+        "- The action must resolve or test the underlying concern — it should "
+        "read clearly differently from the risk text even though it addresses "
+        "the same issue.\n"
+        "  Example risk: \"Location data shows many nearby competitors, but no "
+        "specific rivals were named — the real level of direct competition is "
+        "unclear.\"\n"
+        "  Example task: \"Walk the target neighborhood and count how many "
+        "direct competitors in this exact niche are actually operating nearby, "
+        "since map density and named research disagree.\"\n"
+        "- Do not invent unrelated work; stay tightly tied to the concern.\n"
+        "- Do not start with \"Verify that…\" restating the risk as a belief.\n\n"
+        f"Verification / risk statements:\n{json.dumps(verification_items, indent=2)}"
+    )
+
+    result = invoke_with_retry(
+        lambda: structured_llm.invoke(prompt),
+        label="task-planner-verification",
+    )
+
+    by_index: dict[int, str] = {}
+    for draft in result.tasks:
+        idx = draft.verification_index
+        if idx < 0 or idx >= len(verification_items):
+            continue
+        title = draft.title.strip()
+        if title:
+            by_index[idx] = title
+
+    titles: list[str] = []
+    for idx, text in enumerate(verification_items):
+        titles.append(
+            by_index.get(idx)
+            or f"Check this unresolved concern with a concrete local visit: {text}"
+        )
+    return titles
+
+
 def _validation_titles_from_assumptions(assumptions: list[str]) -> list[str]:
     """Convert belief-style assumptions into concrete validation action titles."""
     if not assumptions:
@@ -225,15 +300,22 @@ def generate_task_plan(strategy: dict) -> list[dict]:
         )
     )
 
+    verification_items: list[str] = []
     for item in strategy.get("verification_needed") or []:
         text = str(item).strip()
         if not text:
             continue
+        verification_items.append(text)
+
+    verification_titles = _validation_titles_from_verification_needed(
+        verification_items
+    )
+    for title in verification_titles:
         validate_tasks.append(
             _task(
                 task_id=_next_task_id(counter),
                 phase="validate",
-                title=text,
+                title=title,
                 priority="P0",
                 depends_on=[t1],
                 source="verification_needed",

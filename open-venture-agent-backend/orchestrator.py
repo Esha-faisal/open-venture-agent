@@ -44,8 +44,60 @@ class DeliveryModeResult(BaseModel):
     )
 
 
+class IdeaValidationResult(BaseModel):
+    is_valid_idea: bool = Field(
+        description=(
+            "True if the input is a genuine, describable business idea "
+            "(even if vague, incomplete, or informal). False if nonsense, "
+            "gibberish, random characters/numbers, a single word with no "
+            "business meaning, or too empty to interpret as a venture idea."
+        )
+    )
+    needs_location: bool = Field(
+        description=(
+            "True only when this idea would primarily be onsite or hybrid "
+            "(customers visit a physical place, or a meaningful physical + "
+            "remote mix). False for fully remote/online businesses that do "
+            "not need a city or area for research."
+        )
+    )
+    has_location: bool = Field(
+        description=(
+            "True if the business idea names a specific city, neighborhood, "
+            "area, district, mall, or region where the physical business would "
+            "operate. False if no actionable place name is present."
+        )
+    )
+    message: str = Field(
+        description=(
+            "When is_valid_idea is false, the invalid-idea explanation. "
+            "When the idea is valid but needs_location is true and "
+            "has_location is false, the missing-location explanation. "
+            "Otherwise an empty string."
+        )
+    )
+
+
+_INVALID_INPUT_MESSAGE = (
+    "This doesn't look like a business idea — try describing what you'd "
+    "like to sell or offer, and ideally where."
+)
+
+_MISSING_LOCATION_MESSAGE = (
+    "This looks like a physical/onsite business — please include a city "
+    "or area so we can research the local market."
+)
+
+
 class VentureOrchestratorState(TypedDict, total=False):
     business_idea: str
+    input_valid: bool
+    input_message: str
+    needs_location: bool
+    has_location: bool
+    location_valid: bool
+    location_message: str
+    status: str
     delivery_mode: DeliveryMode
     delivery_mode_rationale: str
     research_findings: list[dict]
@@ -61,8 +113,104 @@ class VentureOrchestratorState(TypedDict, total=False):
     final_report: dict
 
 
+def validate_idea(state: VentureOrchestratorState) -> dict:
+    """Single Gemini check: valid idea + whether a location is required/present."""
+    idea = str(state.get("business_idea") or "").strip()
+    if len(idea) < 3:
+        return {
+            "input_valid": False,
+            "input_message": _INVALID_INPUT_MESSAGE,
+            "needs_location": False,
+            "has_location": False,
+            "location_valid": False,
+            "location_message": "",
+            "status": "invalid_input",
+        }
+
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
+    structured_llm = llm.with_structured_output(IdeaValidationResult)
+    prompt = (
+        "Validate this founder input in one pass.\n\n"
+        "1) is_valid_idea — true when the text describes (even vaguely or "
+        "informally) something to sell, offer, build, or operate — e.g. a "
+        "shop, service, product, cafe, gym, app, cart, clinic. Incomplete "
+        "wording, typos, and missing details are still valid if the intent "
+        "is clearly a business. False for nonsense, gibberish, random "
+        "numbers/characters, keyboard mash, a single meaningless word, "
+        "empty/near-empty, or clearly not a business idea.\n\n"
+        "2) needs_location — true ONLY if the idea would primarily be "
+        "onsite or hybrid (physical premises customers visit, or a "
+        "meaningful physical + remote mix). False for fully remote/online "
+        "businesses (SaaS, online tutoring, dropshipping, etc.).\n\n"
+        "3) has_location — true when the text names a city, town, "
+        "neighborhood, district, area, mall, or region (e.g. \"Lahore\", "
+        "\"Bahria Town, Islamabad\", \"Packages Mall\", \"Gulberg\"). "
+        "False when there is no actionable place name.\n\n"
+        "4) message — set exactly as follows:\n"
+        f"- If is_valid_idea is false: \"{_INVALID_INPUT_MESSAGE}\"\n"
+        "- If is_valid_idea is true AND needs_location is true AND "
+        f"has_location is false: \"{_MISSING_LOCATION_MESSAGE}\"\n"
+        "- Otherwise: empty string.\n\n"
+        f"Input: {idea}"
+    )
+    result = invoke_with_retry(
+        lambda: structured_llm.invoke(prompt),
+        label="validate-idea",
+    )
+
+    is_valid = bool(result.is_valid_idea)
+    needs_location = bool(result.needs_location) if is_valid else False
+    has_location = bool(result.has_location)
+    message = (result.message or "").strip()
+
+    if not is_valid:
+        return {
+            "input_valid": False,
+            "input_message": message or _INVALID_INPUT_MESSAGE,
+            "needs_location": False,
+            "has_location": has_location,
+            "location_valid": False,
+            "location_message": "",
+            "status": "invalid_input",
+        }
+
+    if needs_location and not has_location:
+        return {
+            "input_valid": True,
+            "input_message": "",
+            "needs_location": True,
+            "has_location": False,
+            "location_valid": False,
+            "location_message": message or _MISSING_LOCATION_MESSAGE,
+            "status": "missing_location",
+        }
+
+    return {
+        "input_valid": True,
+        "input_message": "",
+        "needs_location": needs_location,
+        "has_location": has_location,
+        "location_valid": True,
+        "location_message": "",
+        "status": "validated",
+    }
+
+
+def route_after_validate_idea(
+    state: VentureOrchestratorState,
+) -> Literal["infer_delivery_mode", "end"]:
+    if (
+        state.get("input_valid") is False
+        or state.get("status") == "invalid_input"
+        or state.get("location_valid") is False
+        or state.get("status") == "missing_location"
+    ):
+        return "end"
+    return "infer_delivery_mode"
+
+
 def infer_delivery_mode(state: VentureOrchestratorState) -> dict:
-    """Infer delivery_mode and write it into shared graph state."""
+    """Infer delivery_mode; safety-net missing location if mode is physical."""
     llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
     structured_llm = llm.with_structured_output(DeliveryModeResult)
 
@@ -81,16 +229,32 @@ def infer_delivery_mode(state: VentureOrchestratorState) -> dict:
         lambda: structured_llm.invoke(prompt),
         label="delivery-mode",
     )
-    return {
+    updates: dict = {
         "delivery_mode": result.delivery_mode,
         "delivery_mode_rationale": result.rationale,
     }
+    # If delivery landed physical but the combined validation found no place
+    # name (e.g. needs_location was underestimated), stop before research.
+    if result.delivery_mode in {"onsite", "hybrid"} and state.get("has_location") is False:
+        updates.update(
+            {
+                "location_valid": False,
+                "location_message": _MISSING_LOCATION_MESSAGE,
+                "status": "missing_location",
+            }
+        )
+    return updates
 
 
 def route_after_delivery_mode(
     state: VentureOrchestratorState,
-) -> Literal["location"] | list[str]:
-    """Gate Location Agent; remote fans out directly to parallel research nodes."""
+) -> Literal["location", "end"] | list[str]:
+    """Stop on missing location; otherwise gate Location Agent vs remote fan-out."""
+    if (
+        state.get("location_valid") is False
+        or state.get("status") == "missing_location"
+    ):
+        return "end"
     if state.get("delivery_mode") in {"onsite", "hybrid"}:
         return "location"
     return list(_PARALLEL_RESEARCH_NODES)
@@ -121,7 +285,10 @@ def competitor_node(state: VentureOrchestratorState) -> dict:
 
 def customer_node(state: VentureOrchestratorState) -> dict:
     """Customer branch — only writes customer research keys."""
-    customer = run_customer_research(state["business_idea"])
+    customer = run_customer_research(
+        state["business_idea"],
+        delivery_mode=state.get("delivery_mode"),
+    )
     return {
         "customer_segments": customer.get("customer_segments") or [],
         "customer_pain_points": customer.get("customer_pain_points") or [],
@@ -277,6 +444,7 @@ def run_final_report(state: VentureOrchestratorState) -> dict:
 
 def build_orchestrator_graph():
     graph = StateGraph(VentureOrchestratorState)
+    graph.add_node("validate_idea", validate_idea)
     graph.add_node("infer_delivery_mode", infer_delivery_mode)
     graph.add_node("location", run_location)
     graph.add_node("research_node", research_node)
@@ -287,12 +455,21 @@ def build_orchestrator_graph():
     graph.add_node("task_planning", run_task_planning)
     graph.add_node("final_report", run_final_report)
 
-    graph.add_edge(START, "infer_delivery_mode")
+    graph.add_edge(START, "validate_idea")
+    graph.add_conditional_edges(
+        "validate_idea",
+        route_after_validate_idea,
+        {
+            "infer_delivery_mode": "infer_delivery_mode",
+            "end": END,
+        },
+    )
     graph.add_conditional_edges(
         "infer_delivery_mode",
         route_after_delivery_mode,
         {
             "location": "location",
+            "end": END,
             "research_node": "research_node",
             "competitor_node": "competitor_node",
             "customer_node": "customer_node",
@@ -317,7 +494,26 @@ venture_orchestrator = build_orchestrator_graph()
 def run_venture_pipeline(business_idea: str) -> dict:
     """Run the full venture pipeline; location is gated by delivery_mode."""
     result = venture_orchestrator.invoke({"business_idea": business_idea})
+    if result.get("status") == "invalid_input" or result.get("input_valid") is False:
+        return {
+            "status": "invalid_input",
+            "message": (
+                str(result.get("input_message") or "").strip() or _INVALID_INPUT_MESSAGE
+            ),
+        }
+    if (
+        result.get("status") == "missing_location"
+        or result.get("location_valid") is False
+    ):
+        return {
+            "status": "missing_location",
+            "message": (
+                str(result.get("location_message") or "").strip()
+                or _MISSING_LOCATION_MESSAGE
+            ),
+        }
     return {
+        "status": result.get("status") or "completed",
         "delivery_mode": result.get("delivery_mode"),
         "delivery_mode_rationale": result.get("delivery_mode_rationale"),
         "research_findings": result.get("research_findings") or [],

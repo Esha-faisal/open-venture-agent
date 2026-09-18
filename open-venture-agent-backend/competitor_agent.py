@@ -11,6 +11,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
+from text_sanitize import sanitize_display_text
 
 FindingCategory = Literal[
     "competitor",
@@ -92,10 +93,30 @@ class CompetitorFinding(BaseModel):
             "'best places' article that is not itself a business."
         )
     )
+    operates_in_target_location: bool = Field(
+        description=(
+            "True ONLY when the source content clearly confirms relevance to "
+            "the specific target city/area from the business idea. Cross-city "
+            "name matches (same brand/name in a different city) must be false. "
+            "If the source does not clearly confirm the target location, set "
+            "false — do not assume branches or related outlets. For "
+            "location-agnostic vendor tooling only, true is allowed. False "
+            "entries must NOT appear in the findings list at all — omit them "
+            "entirely rather than explaining why they were rejected."
+        )
+    )
 
 
 class CompetitorFindingsList(BaseModel):
-    findings: list[CompetitorFinding] = Field(min_length=3, max_length=5)
+    findings: list[CompetitorFinding] = Field(
+        min_length=0,
+        max_length=5,
+        description=(
+            "0-5 geographically relevant entries only. Omit cross-city or "
+            "unconfirmed-location sources entirely — never pad with rejected "
+            "items or explanations of what was filtered out."
+        ),
+    )
 
 
 class CompetitorState(TypedDict):
@@ -210,9 +231,63 @@ def _normalize_finding_fields(findings: list[dict]) -> list[dict]:
         elif not str(row.get("competitor_name") or "").strip():
             row["competitor_name"] = None
         else:
-            row["competitor_name"] = str(row["competitor_name"]).strip()
+            row["competitor_name"] = sanitize_display_text(str(row["competitor_name"]))
+        row["finding"] = sanitize_display_text(str(row.get("finding") or ""))
         normalized.append(row)
     return normalized
+
+
+def _filter_geographic_mismatches(findings: list[dict]) -> list[dict]:
+    """Drop every finding that failed geographic relevance — no explanations kept.
+
+    The LLM sets operates_in_target_location during extraction. Anything false
+    or missing is omitted entirely so the frontend never sees rejected
+    cross-city / off-target sources. Empty results are intentional.
+    """
+    kept: list[dict] = []
+    for item in findings:
+        if not item.get("operates_in_target_location"):
+            continue
+        row = dict(item)
+        row.pop("operates_in_target_location", None)
+        kept.append(row)
+    return kept
+
+
+def _looks_like_rejection_note(finding: str) -> bool:
+    """True when the finding mainly explains why a source was irrelevant."""
+    text = finding.lower().strip()
+    if not text:
+        return True
+    markers = (
+        "not relevant",
+        "not located in",
+        "not in the target",
+        "different city",
+        "another city",
+        "outside the target",
+        "does not operate in",
+        "doesn't operate in",
+        "only operates in",
+        "unrelated to the target",
+        "wrong city",
+        "cross-city",
+        "excluded because",
+        "rejected because",
+        "should not be counted",
+        "cannot confirm it operates",
+        "no evidence it operates in",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _filter_rejection_notes(findings: list[dict]) -> list[dict]:
+    """Strip leftover 'why we rejected this' writeups if the model still emits them."""
+    return [
+        item
+        for item in findings
+        if not _looks_like_rejection_note(str(item.get("finding") or ""))
+    ]
 
 
 def _flag_possible_duplicates(findings: list[dict]) -> list[dict]:
@@ -275,10 +350,34 @@ def summarize_competitors(state: CompetitorState) -> dict:
     prompt = (
         "You are a competitive intelligence analyst. From the search results below, "
         "extract 3-5 specific entries relevant to this business idea.\n\n"
+        "First, infer the TARGET LOCATION (city and/or neighborhood/area) from the "
+        "business idea. Every local rival you keep must be verified against that "
+        "specific place — not a different city that happens to share a business name.\n\n"
         "STRICT COMPETITOR CRITERIA — category \"competitor\" ONLY if the entity is an "
         "actual business that sells the same or overlapping products/services to the "
         "same customers in the same area (e.g. another grocery store, supermarket, "
         "cash & carry, bakery, gym). Topical relatedness is NOT enough.\n\n"
+        "GEOGRAPHIC VALIDATION — mandatory for every entry you keep:\n"
+        "- Before including anything, check that the SOURCE CONTENT clearly "
+        "confirms it is about the target city/area from the business idea — "
+        "not merely that a name matches something you searched.\n"
+        "- If a source is about a different city/region (cross-city name "
+        "match), or does not clearly place the business in the target "
+        "location: OMIT IT ENTIRELY from findings. Do not include it under "
+        "any category. Do not write a finding that explains why it is "
+        "irrelevant, why it was rejected, or that it is \"in Lahore not "
+        "Islamabad\" etc. The output list must contain ONLY kept, relevant "
+        "results — never a padded list of rejections.\n"
+        "- Example: idea in Islamabad, source only describes \"Fasana Cafe\" "
+        "in Lahore → do not emit that entry at all.\n"
+        "- Same-name chains only count when the source explicitly places that "
+        "outlet in the target city/area.\n"
+        "- Set operates_in_target_location=true only for entries you keep. "
+        "Never emit an entry with operates_in_target_location=false.\n"
+        "- Mention the confirmed location in the finding text when you keep a "
+        "rival.\n"
+        "- Returning 0 findings is acceptable when nothing is geographically "
+        "relevant.\n\n"
         "DIRECTORY / LISTING SOURCES — mandatory:\n"
         "- If a source is a business directory, listing aggregator, yellow-pages style "
         "site, or a \"best places to shop\" / \"top stores in X\" article that names "
@@ -289,8 +388,9 @@ def summarize_competitors(state: CompetitorState) -> dict:
         "directory — but the directory site itself is not a competitor.\n"
         "- If the directory page clearly names specific local rival businesses, prefer "
         "extracting those named businesses as separate category \"competitor\" entries "
-        "(with their real business names) when the evidence supports it, instead of "
-        "labeling the directory as a competitor.\n\n"
+        "(with their real business names) when the evidence supports it AND the source "
+        "places them in the target location, instead of labeling the directory as a "
+        "competitor.\n\n"
         "EXPLICITLY EXCLUDE from category \"competitor\" (keep them if useful, but "
         "categorize correctly):\n"
         "- software / POS / billing / inventory vendors and SaaS tools "
@@ -304,22 +404,29 @@ def summarize_competitors(state: CompetitorState) -> dict:
         "- generic how-to articles or news pieces without a named local rival "
         "business\n"
         "- tool and technology providers that sell TO businesses, not TO the same "
-        "end customers (category: vendor_technology)\n\n"
+        "end customers (category: vendor_technology)\n"
+        "- any named business whose source only confirms operations in a different "
+        "city/area than the target location\n\n"
         "Prioritize local and regional rival businesses near the stated location over "
         "well-known international chains — only include global brands as competitors "
-        "if they actually operate in that specific area.\n\n"
+        "if they actually operate in that specific area (source must say so).\n\n"
         "For each entry, provide:\n"
         "- competitor_name: rival business name, pricing-site label, or vendor name; "
         "MUST be null for directory_source. This field does NOT imply a business "
         "rival unless category is \"competitor\".\n"
         "- finding: a concise insight (pricing, strengths, weaknesses, reviews, "
-        "or why this source matters)\n"
+        "or why this source matters); for competitors, include where they operate "
+        "when the source states it\n"
         "- source: a URL from the search results supporting this finding\n"
         "- category: one of \"competitor\", \"pricing_intelligence\", "
-        "\"vendor_technology\", \"directory_source\"\n\n"
+        "\"vendor_technology\", \"directory_source\"\n"
+        "- operates_in_target_location: boolean geographic check described above\n\n"
         "Prefer true local competitors when available. If search results mainly "
-        "surface directories, pricing sites, or vendors, include them with the "
-        "correct category rather than mislabeling them as competitors.\n\n"
+        "surface directories, pricing sites, or vendors that are relevant to the "
+        "target area, include them with the correct category rather than "
+        "mislabeling them as competitors. Never pad the list with off-target "
+        "or rejected sources. Fewer (or zero) relevant findings is better than "
+        "including cross-city name matches or \"here's what we rejected\" notes.\n\n"
         f"Business idea: {state['business_idea']}\n\n"
         f"Search results:\n{state['search_results']}"
     )
@@ -330,6 +437,8 @@ def summarize_competitors(state: CompetitorState) -> dict:
     findings = _normalize_finding_fields(
         [item.model_dump() for item in result.findings]
     )
+    findings = _filter_geographic_mismatches(findings)
+    findings = _filter_rejection_notes(findings)
     findings = _dedupe_exact_findings(findings)
     return {"findings": _flag_possible_duplicates(findings)}
 

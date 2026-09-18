@@ -2,10 +2,12 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, model_serializer
-from sqlalchemy import select
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, model_serializer
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import (
@@ -19,6 +21,7 @@ from database import (
     create_tables,
 )
 from orchestrator import run_venture_pipeline
+from text_sanitize import sanitize_display_text
 
 
 @asynccontextmanager
@@ -28,6 +31,14 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    # Vite may bind 5173, 5174, etc. — accept any localhost / 127.0.0.1 port in dev.
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class HealthResponse(BaseModel):
@@ -36,6 +47,19 @@ class HealthResponse(BaseModel):
 
 class VentureRequest(BaseModel):
     business_idea: str
+
+
+class InvalidInputResponse(BaseModel):
+    status: Literal["invalid_input"] = "invalid_input"
+    message: str
+
+
+class MissingLocationResponse(BaseModel):
+    status: Literal["missing_location"] = "missing_location"
+    message: str
+
+
+EarlyExitResponse = InvalidInputResponse | MissingLocationResponse
 
 
 class FindingResponse(BaseModel):
@@ -93,10 +117,15 @@ class StrategyResponse(BaseModel):
     first_call_question: str | None = None
 
 
+class HiringPostingResponse(BaseModel):
+    role: str = ""
+    detail: str = ""
+
+
 class HiringSignalResponse(BaseModel):
-    postings_found: list[str]
-    employer_count: int
-    confidence: str
+    postings_found: list[HiringPostingResponse] = []
+    employer_count: int = 0
+    confidence: str = "none"
     query_used: str | None = None
 
 
@@ -153,13 +182,31 @@ class FinalReportTaskResponse(BaseModel):
         return data
 
 
+class RecommendedStrategyResponse(BaseModel):
+    positioning: str = ""
+    target_customers: str = ""
+    pricing_strategy: str = ""
+    key_differentiators: list[str] = []
+
+
+class KeyFindingsResponse(BaseModel):
+    market_research: list[str] = []
+    competitors: list[str] = []
+    customer_pain_points: list[str] = []
+    customer_segments: list[str] = []
+    hiring_signal: list[str] = []
+
+
 class FinalReportResponse(BaseModel):
     headline: str
     opportunity_tier: str | None = None
     confidence: int | None = None
-    key_findings: list[str] = []
+    recommended_strategy: RecommendedStrategyResponse | None = None
+    key_findings: KeyFindingsResponse = Field(default_factory=KeyFindingsResponse)
     top_risks: list[str] = []
+    data_limitations: list[str] = []
     immediate_next_steps: list[FinalReportTaskResponse] = []
+    full_analysis: str | None = None
     full_data: dict | None = None
 
 
@@ -312,13 +359,43 @@ def _strategy_response_from_model(strategy: Strategy | None) -> StrategyResponse
     )
 
 
+def _normalize_hiring_posting(item) -> HiringPostingResponse | None:
+    """Accept structured {role, detail} or legacy plain-string postings."""
+    if isinstance(item, dict):
+        role = sanitize_display_text(str(item.get("role") or "")).strip()
+        detail = sanitize_display_text(str(item.get("detail") or "")).strip()
+        if not role and not detail:
+            return None
+        return HiringPostingResponse(role=role, detail=detail)
+    text = sanitize_display_text(str(item or "")).strip()
+    if not text:
+        return None
+    # Legacy blended string — best-effort title split on first colon/dash.
+    for sep in (": ", " — ", " - "):
+        if sep in text:
+            role, _, detail = text.partition(sep)
+            role = role.strip()
+            detail = detail.strip()
+            if role and detail:
+                return HiringPostingResponse(role=role, detail=detail)
+    return HiringPostingResponse(role="", detail=text)
+
+
 def _hiring_signal_response(
     data: dict | None,
 ) -> HiringSignalResponse | None:
     if not data:
         return None
+    postings = [
+        posting
+        for posting in (
+            _normalize_hiring_posting(item)
+            for item in (data.get("postings_found") or [])
+        )
+        if posting is not None
+    ]
     return HiringSignalResponse(
-        postings_found=data.get("postings_found") or [],
+        postings_found=postings,
         employer_count=int(data.get("employer_count") or 0),
         confidence=str(data.get("confidence") or "none"),
         query_used=data.get("query_used"),
@@ -429,20 +506,73 @@ def _task_response_from_data(item: dict) -> TaskResponse:
     )
 
 
+def _sanitize_finding_list(items: list | None) -> list[str]:
+    return [
+        sanitize_display_text(str(item))
+        for item in (items or [])
+        if str(item).strip()
+    ]
+
+
+def _key_findings_response(raw) -> KeyFindingsResponse:
+    """Normalize stored key_findings (categorized dict or legacy flat list)."""
+    if isinstance(raw, dict):
+        return KeyFindingsResponse(
+            market_research=_sanitize_finding_list(raw.get("market_research")),
+            competitors=_sanitize_finding_list(raw.get("competitors")),
+            customer_pain_points=_sanitize_finding_list(
+                raw.get("customer_pain_points")
+            ),
+            customer_segments=_sanitize_finding_list(raw.get("customer_segments")),
+            hiring_signal=_sanitize_finding_list(raw.get("hiring_signal")),
+        )
+    if isinstance(raw, list):
+        # Legacy flat list — keep visible under market_research.
+        return KeyFindingsResponse(market_research=_sanitize_finding_list(raw))
+    return KeyFindingsResponse()
+
+
 def _final_report_response(data: dict | None) -> FinalReportResponse | None:
     if not data:
         return None
+    recommended = data.get("recommended_strategy")
+    recommended_response = None
+    if isinstance(recommended, dict):
+        recommended_response = RecommendedStrategyResponse(
+            positioning=sanitize_display_text(recommended.get("positioning") or ""),
+            target_customers=sanitize_display_text(
+                recommended.get("target_customers") or ""
+            ),
+            pricing_strategy=sanitize_display_text(
+                recommended.get("pricing_strategy") or ""
+            ),
+            key_differentiators=[
+                sanitize_display_text(str(item))
+                for item in (recommended.get("key_differentiators") or [])
+            ],
+        )
+    full_analysis = data.get("full_analysis")
     return FinalReportResponse(
-        headline=str(data.get("headline") or ""),
+        headline=sanitize_display_text(data.get("headline") or ""),
         opportunity_tier=data.get("opportunity_tier"),
         confidence=data.get("confidence"),
-        key_findings=list(data.get("key_findings") or []),
-        top_risks=list(data.get("top_risks") or []),
+        recommended_strategy=recommended_response,
+        key_findings=_key_findings_response(data.get("key_findings")),
+        top_risks=[
+            sanitize_display_text(str(item))
+            for item in (data.get("top_risks") or [])
+            if str(item).strip()
+        ],
+        data_limitations=[
+            sanitize_display_text(str(item))
+            for item in (data.get("data_limitations") or [])
+            if str(item).strip()
+        ],
         immediate_next_steps=[
             FinalReportTaskResponse(
                 task_id=step.get("task_id"),
                 phase=step.get("phase"),
-                title=step.get("title"),
+                title=sanitize_display_text(step.get("title") or "") or step.get("title"),
                 priority=step.get("priority"),
                 depends_on=list(step.get("depends_on") or []),
                 source=step.get("source"),
@@ -451,6 +581,9 @@ def _final_report_response(data: dict | None) -> FinalReportResponse | None:
             for step in (data.get("immediate_next_steps") or [])
             if isinstance(step, dict)
         ],
+        full_analysis=(
+            sanitize_display_text(str(full_analysis).strip()) if full_analysis else None
+        ),
         full_data=data.get("full_data"),
     )
 
@@ -485,17 +618,51 @@ async def health_check() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-@app.post("/venture", response_model=VentureResponse)
+@app.post("/venture", response_model=VentureResponse | EarlyExitResponse)
 async def create_venture(
     payload: VentureRequest,
-    db: AsyncSession = Depends(get_db),
-) -> VentureResponse:
-    venture = Venture(business_idea=payload.business_idea)
-    db.add(venture)
-    await db.commit()
-    await db.refresh(venture)
+) -> VentureResponse | EarlyExitResponse:
+    business_idea = (payload.business_idea or "").strip()
+    if not business_idea:
+        return InvalidInputResponse(
+            message=(
+                "This doesn't look like a business idea — try describing what "
+                "you'd like to sell or offer, and ideally where."
+            )
+        )
 
-    pipeline = await asyncio.to_thread(run_venture_pipeline, venture.business_idea)
+    # Run pipeline first so early exits never create a venture row or report.
+    pipeline = await asyncio.to_thread(run_venture_pipeline, business_idea)
+    if pipeline.get("status") == "invalid_input":
+        return InvalidInputResponse(
+            message=str(
+                pipeline.get("message")
+                or (
+                    "This doesn't look like a business idea — try describing what "
+                    "you'd like to sell or offer, and ideally where."
+                )
+            )
+        )
+    if pipeline.get("status") == "missing_location":
+        return MissingLocationResponse(
+            message=str(
+                pipeline.get("message")
+                or (
+                    "This looks like a physical/onsite business — please include "
+                    "a city or area so we can research the local market."
+                )
+            )
+        )
+
+    # Short-lived sessions only — never hold a Neon connection across the
+    # multi-minute research pipeline.
+    async with AsyncSessionLocal() as db:
+        venture = Venture(business_idea=business_idea)
+        db.add(venture)
+        await db.commit()
+        await db.refresh(venture)
+        venture_id = venture.id
+        venture_status = venture.status
 
     research_data = pipeline.get("research_findings") or []
     competitor_data = pipeline.get("competitor_findings") or []
@@ -510,56 +677,67 @@ async def create_venture(
     no_local_data_reason = pipeline.get("no_local_data_reason")
     final_report = pipeline.get("final_report")
 
-    venture.delivery_mode = delivery_mode
-    venture.hiring_signal = hiring_signal
-    venture.final_report = final_report
-    await db.commit()
-    await db.refresh(venture)
+    async with AsyncSessionLocal() as db:
+        venture = await db.get(Venture, venture_id)
+        if venture is None:
+            raise HTTPException(status_code=500, detail="Venture disappeared after create")
 
-    saved_findings: list[ResearchFinding] = []
-    for item in research_data:
-        finding = ResearchFinding(
-            venture_id=venture.id,
-            finding=item["finding"],
-            source=item["source"],
-            source_agent="research",
+        venture.delivery_mode = delivery_mode
+        venture.hiring_signal = hiring_signal
+        venture.final_report = final_report
+        await db.commit()
+        await db.refresh(venture)
+
+        saved_findings: list[ResearchFinding] = []
+        for item in research_data:
+            finding = ResearchFinding(
+                venture_id=venture.id,
+                finding=item["finding"],
+                source=item["source"],
+                source_agent="research",
+            )
+            db.add(finding)
+            saved_findings.append(finding)
+
+        for item in competitor_data:
+            finding = ResearchFinding(
+                venture_id=venture.id,
+                finding=item["finding"],
+                source=item["source"],
+                source_agent="competitor",
+                competitor_name=item.get("competitor_name"),
+                category=item.get("category"),
+            )
+            db.add(finding)
+            saved_findings.append(finding)
+
+        # Only persist location when Location Agent actually ran.
+        if location_data is not None and location_data.get("status") != "skipped":
+            db.add(_save_location(venture.id, location_data))
+
+        if strategy_data is not None:
+            db.add(_save_strategy(venture.id, strategy_data))
+
+        db.add(
+            _save_customer_research(
+                venture.id,
+                segments=customer_segments,
+                pain_points=customer_pain_points,
+                confidence=customer_confidence,
+                no_local_data_reason=no_local_data_reason,
+            )
         )
-        db.add(finding)
-        saved_findings.append(finding)
 
-    for item in competitor_data:
-        finding = ResearchFinding(
-            venture_id=venture.id,
-            finding=item["finding"],
-            source=item["source"],
-            source_agent="competitor",
-            competitor_name=item.get("competitor_name"),
-            category=item.get("category"),
-        )
-        db.add(finding)
-        saved_findings.append(finding)
+        for item in task_plan:
+            db.add(_save_task(venture.id, item))
 
-    # Only persist location when Location Agent actually ran.
-    if location_data is not None and location_data.get("status") != "skipped":
-        db.add(_save_location(venture.id, location_data))
+        await db.commit()
 
-    if strategy_data is not None:
-        db.add(_save_strategy(venture.id, strategy_data))
+        for finding in saved_findings:
+            await db.refresh(finding)
 
-    db.add(
-        _save_customer_research(
-            venture.id,
-            segments=customer_segments,
-            pain_points=customer_pain_points,
-            confidence=customer_confidence,
-            no_local_data_reason=no_local_data_reason,
-        )
-    )
-
-    for item in task_plan:
-        db.add(_save_task(venture.id, item))
-
-    await db.commit()
+        response_status = venture.status
+        response_delivery_mode = venture.delivery_mode
 
     # Map competitor source+name -> possible_duplicate_of from pipeline (not in DB yet).
     duplicate_flags = {
@@ -571,17 +749,21 @@ async def create_venture(
     }
 
     return VentureResponse(
-        id=venture.id,
-        status=venture.status,
-        delivery_mode=venture.delivery_mode,
+        id=venture_id,
+        status=response_status or venture_status,
+        delivery_mode=response_delivery_mode,
         findings=[
             FindingResponse(
-                finding=item.finding,
+                finding=sanitize_display_text(item.finding),
                 source=item.source,
                 source_agent=item.source_agent,
                 **(
                     {
-                        "competitor_name": item.competitor_name,
+                        "competitor_name": (
+                            sanitize_display_text(item.competitor_name)
+                            if item.competitor_name
+                            else None
+                        ),
                         "category": item.category,
                         "possible_duplicate_of": duplicate_flags.get(
                             (item.source, item.competitor_name)
@@ -642,15 +824,21 @@ async def get_venture(
     customer_research = customer_result.scalar_one_or_none()
 
     research_findings = [
-        StoredResearchFinding(id=f.id, finding=f.finding, source=f.source)
+        StoredResearchFinding(
+            id=f.id,
+            finding=sanitize_display_text(f.finding),
+            source=f.source,
+        )
         for f in findings
         if f.source_agent == "research"
     ]
     competitor_findings = [
         StoredCompetitorFinding(
             id=f.id,
-            competitor_name=f.competitor_name,
-            finding=f.finding,
+            competitor_name=(
+                sanitize_display_text(f.competitor_name) if f.competitor_name else None
+            ),
+            finding=sanitize_display_text(f.finding),
             source=f.source,
             category=f.category,
         )
@@ -675,3 +863,19 @@ async def get_venture(
         task_plan=[_task_response_from_model(t) for t in tasks],
         final_report=_final_report_response(venture.final_report),
     )
+
+
+@app.delete("/venture/{venture_id}")
+async def delete_venture(
+    venture_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    venture = await db.get(Venture, venture_id)
+    if venture is None:
+        raise HTTPException(status_code=404, detail="Venture not found")
+
+    for model in (ResearchFinding, Location, Strategy, Task, CustomerResearch):
+        await db.execute(delete(model).where(model.venture_id == venture_id))
+    await db.delete(venture)
+    await db.commit()
+    return {"status": "deleted", "id": venture_id}

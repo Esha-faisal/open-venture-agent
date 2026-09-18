@@ -6,6 +6,7 @@ from sqlalchemy import DateTime, Float, ForeignKey, JSON, String, Text, func, te
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import NullPool
 
 load_dotenv()
 
@@ -19,9 +20,13 @@ _url = make_url(_raw_url).set(drivername="postgresql+asyncpg")
 _query = {key: value for key, value in _url.query.items() if key not in {"sslmode", "channel_binding"}}
 _url = _url.set(query=_query)
 
+# Neon (and other serverless Postgres) closes idle connections aggressively.
+# NullPool + pre_ping avoids handing out already-closed pooled sockets.
 engine = create_async_engine(
     _url,
     connect_args={"ssl": True, "statement_cache_size": 0},
+    poolclass=NullPool,
+    pool_pre_ping=True,
 )
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

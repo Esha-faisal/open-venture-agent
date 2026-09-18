@@ -27,10 +27,30 @@ class FindingsList(BaseModel):
     findings: list[Finding] = Field(min_length=3, max_length=5)
 
 
+class HiringPosting(BaseModel):
+    role: str = Field(
+        description=(
+            "Short job title / role name only, e.g. 'Event Manager', "
+            "'Pastry Chef', 'Front Desk Associate'. No full sentence."
+        )
+    )
+    detail: str = Field(
+        description=(
+            "Everything else about the posting: location, volume, employer "
+            "context, and what the role focuses on — not repeating the role "
+            "name as a full sentence subject."
+        )
+    )
+
+
 class HiringExtraction(BaseModel):
-    postings_found: list[str] = Field(
+    postings_found: list[HiringPosting] = Field(
         default_factory=list,
-        description="Brief descriptions of relevant job postings found in the search results.",
+        description=(
+            "Relevant job postings, each split into a concise role title and "
+            "a separate detail string. Never blend role + detail into one "
+            "sentence in either field."
+        ),
     )
     employers: list[str] = Field(
         default_factory=list,
@@ -129,6 +149,9 @@ def summarize_findings(state: ResearchState) -> dict:
         "global industry statistics. Only use worldwide figures when no "
         "local or regional data appears in the results — and if you must, "
         "clearly label them as global, not local.\n"
+        "If a search hit is clearly about a different city/region than "
+        f"{location_hint}, omit it entirely — do not include a finding that "
+        "only explains why that source is irrelevant.\n"
         "Each finding must include a short 'finding' insight and a 'source' URL "
         "taken from the search results.\n\n"
         "EVIDENCE DISCIPLINE — follow exactly:\n"
@@ -136,16 +159,27 @@ def summarize_findings(state: ResearchState) -> dict:
         "- Do not make causal leaps (e.g. presence of a business ≠ proof of "
         "demand; one review ≠ proof of a trend; a hiring post ≠ proof of "
         "market growth).\n"
-        "- When a source suggests something but does not prove it, say so "
-        "explicitly using this pattern: \"this confirms X, although the source "
-        "alone does not establish Y.\"\n\n"
+        "- When a source suggests something but does not prove a bigger claim, "
+        "keep the wording modest. Vary how you flag limits — do NOT reuse one "
+        "fixed template (especially avoid repeating "
+        "\"although the source alone does not establish…\" on nearly every "
+        "finding). Sometimes fold the caveat into the sentence; sometimes use "
+        "a different phrasing; and skip an explicit hedge when the finding is "
+        "already carefully limited to what the source shows.\n\n"
         "Example — overclaimed (DO NOT write like this):\n"
         "\"A supermarket operates in this area, which indicates strong regional "
         "demand for retail shopping.\"\n\n"
-        "Example — properly hedged (WRITE like this):\n"
-        "\"A supermarket operates in this area; this confirms retail presence "
-        "locally, although the source alone does not establish overall regional "
-        "demand for retail shopping.\"\n\n"
+        "Examples — appropriately modest (vary across findings; pick what fits):\n"
+        "1. \"A supermarket is listed in this area, which shows retail presence "
+        "locally — not proof of overall regional demand.\"\n"
+        "2. \"Reviews praise the store's hours; that speaks to customer "
+        "satisfaction for this shop, without saying the whole category is "
+        "booming.\"\n"
+        "3. \"Hiring posts for cashiers appear nearby, suggesting some local "
+        "operators are staffing up, though that alone isn't a market-growth "
+        "signal.\"\n"
+        "4. \"One directory lists three bakeries in the neighborhood — useful "
+        "as a snapshot of who is open, not a full competitive census.\"\n\n"
         f"Business idea: {state['business_idea']}\n\n"
         f"Search results:\n{state['search_results']}"
     )
@@ -161,8 +195,18 @@ def summarize_findings(state: ResearchState) -> dict:
         f"(location focus: {location_hint}). "
         "Include gym/fitness/hospitality/retail staff roles when relevant. "
         "Be inclusive: if a posting is in the same city/area and same industry, "
-        "include it. List brief posting descriptions and distinct employer names. "
-        "Only return empty lists if the results contain no job-related content at all.\n\n"
+        "include it.\n\n"
+        "For EVERY posting, return structured fields — never one blended sentence:\n"
+        "- role: the job title / role name only (e.g. \"Event Manager\", "
+        "\"Baker\", \"Fitness Trainer\").\n"
+        "- detail: the rest — open-job counts, location, focus areas, employer "
+        "context (e.g. \"120 open jobs in Lahore Cantonment focusing on event "
+        "planning, budgeting, and sponsorship development.\").\n"
+        "Do not put the full description into role. Do not start detail with "
+        "\"The Event Manager role…\" — detail should read as the supporting "
+        "facts after the title.\n"
+        "Also list distinct employer names. Only return empty lists if the "
+        "results contain no job-related content at all.\n\n"
         f"Business idea: {state['business_idea']}\n"
         f"Search query used: {state.get('hiring_query', '')}\n\n"
         f"Hiring search results:\n{state.get('hiring_search_results', '')}"
@@ -176,8 +220,15 @@ def summarize_findings(state: ResearchState) -> dict:
         dict.fromkeys(name.strip() for name in hiring_result.employers if name.strip())
     )
     employer_count = len(employers)
+    postings_found = []
+    for item in hiring_result.postings_found:
+        role = (item.role or "").strip()
+        detail = (item.detail or "").strip()
+        if not role and not detail:
+            continue
+        postings_found.append({"role": role, "detail": detail})
     hiring_signal = {
-        "postings_found": hiring_result.postings_found,
+        "postings_found": postings_found,
         "employer_count": employer_count,
         "confidence": _hiring_confidence(employer_count),
         "query_used": state.get("hiring_query", ""),
