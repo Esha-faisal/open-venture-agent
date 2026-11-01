@@ -746,7 +746,7 @@ function App() {
       }
       if (axios.isAxiosError(err) && !err.response) {
         setError(
-          'Could not reach the API at http://127.0.0.1:8000. Is the backend running?',
+          `Could not reach the API at ${API_BASE}. Is the backend running?`,
         )
       } else if (err instanceof Error) {
         setError(err.message || 'Could not delete that search.')

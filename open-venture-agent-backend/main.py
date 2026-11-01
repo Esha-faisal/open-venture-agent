@@ -37,11 +37,11 @@ frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[frontend_url] if frontend_url else [],
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+   allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://ova-[a-z0-9]+-esha-797a\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
+
 
 
 class HealthResponse(BaseModel):
