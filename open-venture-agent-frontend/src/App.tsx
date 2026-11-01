@@ -3,7 +3,8 @@ import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import Logo from './Logo'
 
-const API_URL = 'http://127.0.0.1:8000/venture'
+const API_BASE = (import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000').replace(/\/$/, '')
+const API_URL = `${API_BASE}/venture`
 const HISTORY_KEY = 'ova.history'
 const SESSION_KEY = 'ova.session'
 const MAX_HISTORY = 40
@@ -38,6 +39,7 @@ type RecommendedStrategy = {
   positioning?: string
   target_customers?: string
   pricing_strategy?: string
+  estimated_budget?: string
   key_differentiators?: string[]
 }
 
@@ -45,6 +47,7 @@ type KeyFindings = {
   market_research?: string[]
   competitors?: string[]
   customer_pain_points?: string[]
+  operational_pain_points?: string[]
   customer_segments?: string[]
   hiring_signal?: string[]
 }
@@ -53,6 +56,8 @@ type FinalReport = {
   headline: string
   opportunity_tier?: string | null
   confidence?: number | null
+  idea_score?: number | null
+  idea_score_label?: string | null
   recommended_strategy?: RecommendedStrategy | null
   key_findings?: KeyFindings | string[]
   top_risks?: string[]
@@ -61,16 +66,31 @@ type FinalReport = {
   full_analysis?: string | null
 }
 
+type ProsConsItem = {
+  point?: string
+  reasoning?: string
+  source?: string
+}
+
+type ProsAndCons = {
+  pros?: ProsConsItem[]
+  cons?: ProsConsItem[]
+}
+
 type Strategy = {
   positioning?: string
   target_customers?: string
   pricing_strategy?: string
+  estimated_budget?: string | null
   key_differentiators?: string[]
   confidence?: number | null
+  idea_score?: number | null
+  idea_score_label?: string | null
   assumptions?: string[]
   verification_needed?: string[]
   opportunity_tier?: string | null
   first_call_question?: string | null
+  pros_and_cons?: ProsAndCons | null
 }
 
 type ResearchFinding = {
@@ -104,6 +124,7 @@ type CustomerPainPoint = {
 type CustomerResearch = {
   customer_segments?: CustomerSegment[]
   customer_pain_points?: CustomerPainPoint[]
+  operational_pain_points?: CustomerPainPoint[]
   confidence?: string
   no_local_data_reason?: string | null
 }
@@ -155,12 +176,13 @@ type PersistedSession = {
   venture: VentureResponse | null
 }
 
-type Screen = 'input' | 'results' | 'research' | 'strategy' | 'tasks'
+type Screen = 'input' | 'results' | 'research' | 'strategy' | 'pros_cons' | 'tasks'
 
 const VENTURE_NAV_TABS: { screen: Exclude<Screen, 'input'>; label: string }[] = [
   { screen: 'results', label: 'Report' },
   { screen: 'research', label: 'Research' },
   { screen: 'strategy', label: 'Strategy' },
+  { screen: 'pros_cons', label: 'Pros & Cons' },
   { screen: 'tasks', label: 'Tasks' },
 ]
 
@@ -230,28 +252,6 @@ function formatHistoryDate(iso: string): string {
   })
 }
 
-function normalizeHiringPosting(posting: HiringPosting | string): {
-  role: string
-  detail: string
-} {
-  if (typeof posting === 'string') {
-    const text = sanitizeDisplayText(posting).trim()
-    for (const sep of [': ', ' — ', ' - '] as const) {
-      const idx = text.indexOf(sep)
-      if (idx > 0) {
-        const role = text.slice(0, idx).trim()
-        const detail = text.slice(idx + sep.length).trim()
-        if (role && detail) return { role, detail }
-      }
-    }
-    return { role: '', detail: text }
-  }
-  return {
-    role: sanitizeDisplayText(posting.role).trim(),
-    detail: sanitizeDisplayText(posting.detail).trim(),
-  }
-}
-
 /** Fix mangled accents (e.g. "Caf" / "CafÃ©" → "Cafe") for already-saved text. */
 function sanitizeDisplayText(text: string | null | undefined): string {
   if (!text) return ''
@@ -270,11 +270,11 @@ const KEY_FINDING_SECTIONS: {
   key: keyof KeyFindings
   label: string
 }[] = [
-  { key: 'market_research', label: 'Market Research' },
+  { key: 'market_research', label: "What's happening in this industry" },
   { key: 'competitors', label: 'Competitors' },
   { key: 'customer_pain_points', label: 'Customer Pain Points' },
+  { key: 'operational_pain_points', label: 'Operational Pain Points' },
   { key: 'customer_segments', label: 'Customer Segments' },
-  { key: 'hiring_signal', label: 'Hiring Signals' },
 ]
 
 function normalizeKeyFindings(
@@ -399,7 +399,7 @@ function getCompetitorFindings(venture: VentureResponse | null): CompetitorFindi
 function SourceLink({ source }: { source?: string | null }) {
   const text = (source || '').trim()
   if (!text) {
-    return <span className="text-xs text-slate-400">No source</span>
+    return <span className="text-xs text-slate-500">No source</span>
   }
   if (isHttpUrl(text)) {
     return (
@@ -520,11 +520,19 @@ function App() {
   const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory())
   const [historyQuery, setHistoryQuery] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [ideaHasBlurred, setIdeaHasBlurred] = useState(false)
+  const [ideaFocused, setIdeaFocused] = useState(false)
+  const [debouncedIdea, setDebouncedIdea] = useState(businessIdea)
   const mainScrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     mainScrollRef.current?.scrollTo({ top: 0, left: 0, behavior: 'auto' })
   }, [screen])
+
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebouncedIdea(businessIdea), 800)
+    return () => window.clearTimeout(id)
+  }, [businessIdea])
 
   useEffect(() => {
     if (!loading) return
@@ -598,13 +606,16 @@ function App() {
       }
       if (
         response?.status === 'invalid_input' ||
-        response?.status === 'missing_location'
+        response?.status === 'missing_location' ||
+        response?.status === 'existing_business_detected'
       ) {
         const message =
           response.message?.trim() ||
           (response.status === 'missing_location'
             ? 'This looks like a physical/onsite business — please include a city or area so we can research the local market.'
-            : "This doesn't look like a business idea — try describing what you'd like to sell or offer, and ideally where.")
+            : response.status === 'existing_business_detected'
+              ? "This looks like it might be naming an existing company rather than describing a new business idea. Try describing your own concept instead — e.g. 'a mid-range clothing brand in Lahore.'"
+              : "This doesn't look like a business idea — try describing what you'd like to sell or offer, and ideally where.")
         setVenture(null)
         setScreen('input')
         setError(message)
@@ -626,13 +637,16 @@ function App() {
           | undefined
         if (
           body?.status === 'invalid_input' ||
-          body?.status === 'missing_location'
+          body?.status === 'missing_location' ||
+          body?.status === 'existing_business_detected'
         ) {
           setError(
             body.message?.trim() ||
               (body.status === 'missing_location'
                 ? 'This looks like a physical/onsite business — please include a city or area so we can research the local market.'
-                : "This doesn't look like a business idea — try describing what you'd like to sell or offer, and ideally where."),
+                : body.status === 'existing_business_detected'
+                  ? "This looks like it might be naming an existing company rather than describing a new business idea. Try describing your own concept instead — e.g. 'a mid-range clothing brand in Lahore.'"
+                  : "This doesn't look like a business idea — try describing what you'd like to sell or offer, and ideally where."),
           )
         } else if (typeof detail === 'string') {
           setError(detail)
@@ -749,6 +763,9 @@ function App() {
     setVenture(null)
     setError(null)
     setBusinessIdea('')
+    setDebouncedIdea('')
+    setIdeaHasBlurred(false)
+    setIdeaFocused(false)
     setLoading(false)
     setHistoryQuery('')
     clearSession()
@@ -766,8 +783,11 @@ function App() {
   const showLocationWarning =
     screen === 'input' &&
     !loading &&
-    businessIdea.trim().length > 0 &&
-    !looksLikeHasLocation(businessIdea)
+    ideaHasBlurred &&
+    !ideaFocused &&
+    debouncedIdea.trim().length > 0 &&
+    debouncedIdea === businessIdea &&
+    !looksLikeHasLocation(debouncedIdea)
   const ideaDescribedBy = [
     error && !loading ? 'idea-error' : null,
     showLocationWarning ? 'idea-location-warning' : null,
@@ -794,11 +814,10 @@ function App() {
     (item) => getCompetitorGroup(item.category) === 'other',
   )
   const customerResearch = venture?.customer_research ?? null
-  const hiringSignal = venture?.hiring_signal ?? null
   const customerConfidence = (customerResearch?.confidence || 'none').toLowerCase()
   const customerSegments = customerResearch?.customer_segments || []
   const customerPainPoints = customerResearch?.customer_pain_points || []
-  const hiringPostings = hiringSignal?.postings_found || []
+  const operationalPainPoints = customerResearch?.operational_pain_points || []
   const taskPlan = venture?.task_plan || []
   const tasksByPhase = TASK_PHASES.map((phase) => ({
     ...phase,
@@ -824,6 +843,8 @@ function App() {
     strategy?.target_customers || recommended?.target_customers || ''
   const pricingStrategy =
     strategy?.pricing_strategy || recommended?.pricing_strategy || ''
+  const estimatedBudget =
+    strategy?.estimated_budget || recommended?.estimated_budget || ''
   const differentiators =
     strategy?.key_differentiators || recommended?.key_differentiators || []
   const strategyConfidence =
@@ -874,7 +895,7 @@ function App() {
                 value={historyQuery}
                 onChange={(e) => setHistoryQuery(e.target.value)}
                 placeholder="Search history…"
-                className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:bg-white focus:ring-2 focus:ring-teal-500/20"
+                className="w-full rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-sm text-slate-800 outline-none transition placeholder:text-slate-500 focus:border-teal-500 focus:bg-white focus:ring-2 focus:ring-teal-500/20"
               />
             </label>
           </div>
@@ -928,7 +949,7 @@ function App() {
                         disabled={busy}
                         aria-label={`Delete search: ${item.businessIdea}`}
                         title="Delete this search"
-                        className={`absolute top-2 right-1.5 inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-rose-50 hover:text-rose-700 disabled:cursor-wait disabled:opacity-40 max-lg:opacity-100 lg:opacity-0 lg:group-hover:opacity-100 lg:group-focus-within:opacity-100 ${
+                        className={`absolute top-2 right-1.5 inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-rose-50 hover:text-rose-700 disabled:cursor-wait disabled:opacity-40 max-lg:opacity-100 lg:opacity-0 lg:group-hover:opacity-100 lg:group-focus-within:opacity-100 ${
                           deletingItem ? 'opacity-100' : ''
                         }`}
                       >
@@ -998,7 +1019,7 @@ function App() {
                           onClick={() => jumpToScreen(tab.screen)}
                           className={`shrink-0 border-b-2 px-3 py-3 text-sm transition sm:px-4 sm:text-base ${
                             active
-                              ? 'border-teal-700 font-bold text-teal-900'
+                              ? 'border-teal-200 font-bold text-teal-900'
                               : 'border-transparent font-medium text-slate-500 hover:border-slate-300 hover:text-slate-800'
                           }`}
                         >
@@ -1033,7 +1054,7 @@ function App() {
                   <h1 className="text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
                     What venture are you exploring?
                   </h1>
-                  <p className="mt-3 text-base text-slate-600">
+                  <p className="mt-3 text-base text-slate-500">
                     Describe your business idea and location. We&apos;ll research the
                     market, competitors, customers, and strategy.
                   </p>
@@ -1050,11 +1071,16 @@ function App() {
                           setBusinessIdea(e.target.value)
                           if (error) setError(null)
                         }}
+                        onFocus={() => setIdeaFocused(true)}
+                        onBlur={() => {
+                          setIdeaFocused(false)
+                          setIdeaHasBlurred(true)
+                        }}
                         disabled={loading}
                         placeholder="e.g. bakery in Bahria Town, Islamabad"
                         aria-invalid={Boolean(error && !loading)}
                         aria-describedby={ideaDescribedBy || undefined}
-                        className={`w-full rounded-xl border bg-white px-4 py-3 text-base text-slate-900 outline-none transition placeholder:text-slate-400 focus:ring-2 disabled:cursor-not-allowed disabled:bg-slate-50 ${
+                        className={`w-full rounded-xl border bg-white px-4 py-3 text-base text-slate-900 outline-none transition placeholder:text-slate-500 focus:ring-2 disabled:cursor-not-allowed disabled:bg-slate-50 ${
                           error && !loading
                             ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-500/20'
                             : showLocationWarning
@@ -1114,6 +1140,25 @@ function App() {
             {screen === 'results' && report && (
               <main className="flex-1 space-y-6 pb-8">
                 <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-lg shadow-slate-200/50 sm:p-8">
+                  {typeof (report.idea_score ?? strategy?.idea_score) === 'number' && (
+                    <div className="mb-6">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-teal-700">
+                        Idea score
+                      </p>
+                      <p className="mt-2 text-5xl font-bold tracking-tight text-slate-900 sm:text-6xl">
+                        {report.idea_score ?? strategy?.idea_score}
+                        <span className="text-2xl font-semibold text-slate-500 sm:text-3xl">
+                          /100
+                        </span>
+                      </p>
+                      <p className="mt-2 text-base font-medium text-slate-500 sm:text-lg">
+                        {report.idea_score_label ||
+                          strategy?.idea_score_label ||
+                          'Score based on research signals'}
+                      </p>
+                    </div>
+                  )}
+
                   <div className="flex flex-wrap items-center gap-3">
                     <span
                       className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold capitalize ring-1 ring-inset ${resultsTierClass}`}
@@ -1201,7 +1246,7 @@ function App() {
                       {report.data_limitations!.map((item) => (
                         <li
                           key={item}
-                          className="rounded-xl border border-slate-200 bg-slate-50/80 px-4 py-3 text-sm leading-relaxed text-slate-700"
+                          className="rounded-xl border border-slate-100 bg-slate-50/60 px-4 py-3 text-sm leading-relaxed text-slate-700"
                         >
                           {sanitizeDisplayText(item)}
                         </li>
@@ -1227,7 +1272,7 @@ function App() {
                           >
                             <input
                               type="checkbox"
-                              className="mt-1 h-4 w-4 rounded border-slate-300 text-teal-700 focus:ring-teal-600"
+                              className="mt-1 h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-600"
                               aria-label={step.title || 'Next step'}
                             />
                             <div className="min-w-0 flex-1">
@@ -1240,7 +1285,7 @@ function App() {
                                   </span>
                                 )}
                                 {step.phase && (
-                                  <span className="text-xs font-medium uppercase tracking-wide text-slate-400">
+                                  <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
                                     {step.phase}
                                   </span>
                                 )}
@@ -1265,7 +1310,7 @@ function App() {
             {screen === 'research' && venture && (
               <main className="flex-1 space-y-6 pb-8">
                 <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-lg shadow-slate-200/50 sm:p-8">
-                  <p className="text-sm font-medium uppercase tracking-wide text-slate-400">
+                  <p className="text-sm font-medium uppercase tracking-wide text-slate-500">
                     Research
                   </p>
                   <h1 className="mt-3 text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl">
@@ -1280,7 +1325,7 @@ function App() {
 
                 <section className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-md shadow-slate-200/40 sm:p-8">
                   <h2 className="text-lg font-semibold text-slate-900">
-                    Market Research
+                    What&apos;s happening in this industry
                   </h2>
                   {researchFindings.length > 0 ? (
                     <ul className="mt-4 space-y-3">
@@ -1348,7 +1393,7 @@ function App() {
 
                       {vendorFindings.length > 0 && (
                         <div>
-                          <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-400">
+                          <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
                             Tools &amp; Vendors
                           </h3>
                           <ul className="mt-3 space-y-3">
@@ -1364,7 +1409,7 @@ function App() {
                                 >
                                   <div className="flex flex-wrap items-center gap-2">
                                     {item.competitor_name && (
-                                      <h4 className="text-sm font-medium text-slate-600">
+                                      <h4 className="text-sm font-medium text-slate-900">
                                         {sanitizeDisplayText(item.competitor_name)}
                                       </h4>
                                     )}
@@ -1374,7 +1419,7 @@ function App() {
                                       </span>
                                     )}
                                   </div>
-                                  <p className="mt-1.5 text-sm leading-relaxed text-slate-500">
+                                  <p className="mt-1.5 text-sm leading-relaxed text-slate-800">
                                     {sanitizeDisplayText(item.finding)}
                                   </p>
                                   <div className="mt-2">
@@ -1410,7 +1455,7 @@ function App() {
                                       </h4>
                                     )}
                                     {categoryLabel && (
-                                      <span className="inline-flex rounded-md bg-slate-200/80 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-slate-600">
+                                      <span className="inline-flex rounded-md bg-slate-200/80 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                                         {categoryLabel}
                                       </span>
                                     )}
@@ -1510,67 +1555,36 @@ function App() {
                           </p>
                         )}
                       </div>
-                    </div>
-                  )}
-                </section>
 
-                <section className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-md shadow-slate-200/40 sm:p-8">
-                  <h2 className="text-lg font-semibold text-slate-900">
-                    Hiring Signals
-                  </h2>
-                  {hiringSignal ? (
-                    <div className="mt-4 space-y-4">
-                      <div className="flex flex-wrap items-center gap-3">
-                        <span className="inline-flex rounded-full bg-teal-50 px-3 py-1 text-xs font-semibold capitalize text-teal-800 ring-1 ring-inset ring-teal-200">
-                          {hiringSignal.confidence || 'none'} confidence
-                        </span>
-                        <span className="text-sm font-medium text-slate-500">
-                          {typeof hiringSignal.employer_count === 'number'
-                            ? hiringSignal.employer_count
-                            : 0}{' '}
-                          employer
-                          {(hiringSignal.employer_count ?? 0) === 1 ? '' : 's'}
-                        </span>
-                      </div>
-                      {hiringPostings.length > 0 ? (
-                        <ul className="space-y-3">
-                          {hiringPostings.map((posting, index) => {
-                            const { role, detail } = normalizeHiringPosting(posting)
-                            if (!role && !detail) return null
-                            return (
+                      <div>
+                        <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+                          Operational pain points
+                        </h3>
+                        {operationalPainPoints.length > 0 ? (
+                          <ul className="mt-3 space-y-3">
+                            {operationalPainPoints.map((item, index) => (
                               <li
-                                key={`${role}-${detail}-${index}`}
-                                className="rounded-xl border border-slate-100 bg-slate-50/80 px-4 py-3 leading-relaxed text-slate-800"
+                                key={`${item.pain_point}-${index}`}
+                                className="rounded-xl border border-slate-100 bg-slate-50/60 px-4 py-4"
                               >
-                                {role ? (
-                                  <>
-                                    <span className="text-[1.05em] font-bold text-teal-900">
-                                      {role}
-                                    </span>
-                                    {detail ? (
-                                      <span className="text-slate-700">
-                                        {' '}
-                                        — {detail}
-                                      </span>
-                                    ) : null}
-                                  </>
-                                ) : (
-                                  <span className="text-slate-700">{detail}</span>
+                                <p className="leading-relaxed text-slate-800">
+                                  {item.pain_point}
+                                </p>
+                                {item.source && (
+                                  <div className="mt-3">
+                                    <SourceLink source={item.source} />
+                                  </div>
                                 )}
                               </li>
-                            )
-                          })}
-                        </ul>
-                      ) : (
-                        <p className="text-sm text-slate-500">
-                          No related job postings were found.
-                        </p>
-                      )}
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="mt-2 text-sm text-slate-500">
+                            No operational pain points returned.
+                          </p>
+                        )}
+                      </div>
                     </div>
-                  ) : (
-                    <p className="mt-3 text-sm text-slate-500">
-                      No hiring signal returned.
-                    </p>
                   )}
                 </section>
               </main>
@@ -1579,7 +1593,7 @@ function App() {
             {screen === 'strategy' && venture && (
               <main className="flex-1 space-y-6 pb-8">
                 <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-lg shadow-slate-200/50 sm:p-8">
-                  <p className="text-sm font-medium uppercase tracking-wide text-slate-400">
+                  <p className="text-sm font-medium uppercase tracking-wide text-slate-500">
                     Full strategy
                   </p>
                   <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -1597,7 +1611,7 @@ function App() {
                 </div>
 
                 {strategy?.first_call_question && (
-                  <section className="rounded-2xl border border-teal-200 bg-teal-50/90 p-6 shadow-md shadow-teal-100/50 sm:p-8">
+                  <section className="rounded-2xl border border-teal-700 bg-teal-50/90 p-6 shadow-md shadow-teal-100/50 sm:p-8">
                     <p className="text-xs font-semibold uppercase tracking-[0.16em] text-teal-700">
                       First call question
                     </p>
@@ -1634,7 +1648,19 @@ function App() {
 
                 <section className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-md shadow-slate-200/40 sm:p-8">
                   <h2 className="text-lg font-semibold text-slate-900">
-                    Key differentiators
+                    Estimated startup budget
+                  </h2>
+                  <p className="mt-1 text-xs font-medium uppercase tracking-wide text-amber-700/90">
+                    Rough estimate — verify locally
+                  </p>
+                  <p className="mt-3 leading-relaxed text-slate-700">
+                    {estimatedBudget || 'No estimated budget returned.'}
+                  </p>
+                </section>
+
+                <section className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-md shadow-slate-200/40 sm:p-8">
+                  <h2 className="text-lg font-semibold text-slate-900">
+                    What makes you stand out
                   </h2>
                   {differentiators.length > 0 ? (
                     <ul className="mt-4 list-disc space-y-2 pl-5 text-slate-700">
@@ -1703,10 +1729,119 @@ function App() {
               </main>
             )}
 
+            {screen === 'pros_cons' && venture && (
+              <main className="flex-1 space-y-6 pb-8">
+                <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-lg shadow-slate-200/50 sm:p-8">
+                  <p className="text-sm font-medium uppercase tracking-wide text-slate-500">
+                    Pros &amp; Cons
+                  </p>
+                  <h1 className="mt-3 text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl">
+                    What works in your favor — and what doesn&apos;t
+                  </h1>
+                  {(venture.business_idea || businessIdea) && (
+                    <p className="mt-3 text-sm text-slate-500">
+                      {venture.business_idea || businessIdea}
+                    </p>
+                  )}
+                  <p className="mt-3 text-sm text-slate-500">
+                    Each point is grounded in the research for this idea, not
+                    generic advice.
+                  </p>
+                </div>
+
+                {(() => {
+                  const bundle = strategy?.pros_and_cons
+                  const pros = bundle?.pros || []
+                  const cons = bundle?.cons || []
+                  if (pros.length === 0 && cons.length === 0) {
+                    return (
+                      <section className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-md shadow-slate-200/40 sm:p-8">
+                        <p className="text-sm text-slate-500">
+                          No pros and cons returned yet. Run a new research to
+                          generate this section.
+                        </p>
+                      </section>
+                    )
+                  }
+                  return (
+                    <div className="grid gap-6 lg:grid-cols-2">
+                      <section className="rounded-2xl border border-emerald-100 bg-emerald-50/40 p-6 shadow-md shadow-slate-200/40 sm:p-8">
+                        <h2 className="text-lg font-semibold text-emerald-950">
+                          Pros
+                        </h2>
+                        {pros.length > 0 ? (
+                          <ul className="mt-4 space-y-4">
+                            {pros.map((item, index) => (
+                              <li
+                                key={`${item.point}-${index}`}
+                                className="rounded-xl border border-emerald-100/80 bg-white/80 px-4 py-3"
+                              >
+                                <p className="font-semibold text-emerald-950">
+                                  {sanitizeDisplayText(item.point) || 'Pro'}
+                                </p>
+                                {item.reasoning && (
+                                  <p className="mt-2 text-sm leading-relaxed text-slate-700">
+                                    {sanitizeDisplayText(item.reasoning)}
+                                  </p>
+                                )}
+                                {item.source && (
+                                  <p className="mt-2 text-xs leading-relaxed break-all text-slate-500">
+                                    Source: {sanitizeDisplayText(item.source)}
+                                  </p>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="mt-3 text-sm text-slate-500">
+                            No pros returned.
+                          </p>
+                        )}
+                      </section>
+
+                      <section className="rounded-2xl border border-rose-100 bg-rose-50/40 p-6 shadow-md shadow-slate-200/40 sm:p-8">
+                        <h2 className="text-lg font-semibold text-rose-700">
+                          Cons
+                        </h2>
+                        {cons.length > 0 ? (
+                          <ul className="mt-4 space-y-4">
+                            {cons.map((item, index) => (
+                              <li
+                                key={`${item.point}-${index}`}
+                                className="rounded-xl border border-rose-100/80 bg-white/80 px-4 py-3"
+                              >
+                                <p className="font-semibold text-rose-800">
+                                  {sanitizeDisplayText(item.point) || 'Con'}
+                                </p>
+                                {item.reasoning && (
+                                  <p className="mt-2 text-sm leading-relaxed text-slate-700">
+                                    {sanitizeDisplayText(item.reasoning)}
+                                  </p>
+                                )}
+                                {item.source && (
+                                  <p className="mt-2 text-xs leading-relaxed break-all text-slate-500">
+                                    Source: {sanitizeDisplayText(item.source)}
+                                  </p>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="mt-3 text-sm text-slate-500">
+                            No cons returned.
+                          </p>
+                        )}
+                      </section>
+                    </div>
+                  )
+                })()}
+              </main>
+            )}
+
             {screen === 'tasks' && venture && (
               <main className="flex-1 space-y-6 pb-8">
                 <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-lg shadow-slate-200/50 sm:p-8">
-                  <p className="text-sm font-medium uppercase tracking-wide text-slate-400">
+                  <p className="text-sm font-medium uppercase tracking-wide text-slate-500">
                     Task plan
                   </p>
                   <h1 className="mt-3 text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl">
@@ -1748,7 +1883,7 @@ function App() {
                                 >
                                   <input
                                     type="checkbox"
-                                    className="mt-1 h-4 w-4 rounded border-slate-300 text-teal-700 focus:ring-teal-600"
+                                    className="mt-1 h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-600"
                                     aria-label={task.title || 'Task'}
                                   />
                                   <div className="min-w-0 flex-1">
@@ -1761,7 +1896,7 @@ function App() {
                                         </span>
                                       )}
                                       {task.task_id && (
-                                        <span className="text-xs font-medium uppercase tracking-wide text-slate-400">
+                                        <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
                                           {task.task_id}
                                         </span>
                                       )}
@@ -1806,7 +1941,7 @@ function App() {
                               >
                                 <input
                                   type="checkbox"
-                                  className="mt-1 h-4 w-4 rounded border-slate-300 text-teal-700 focus:ring-teal-600"
+                                  className="mt-1 h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-600"
                                   aria-label={task.title || 'Task'}
                                 />
                                 <div className="min-w-0 flex-1">
@@ -1819,7 +1954,7 @@ function App() {
                                       </span>
                                     )}
                                     {task.phase && (
-                                      <span className="text-xs font-medium uppercase tracking-wide text-slate-400">
+                                      <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
                                         {task.phase}
                                       </span>
                                     )}
