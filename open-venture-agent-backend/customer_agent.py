@@ -34,19 +34,39 @@ class CustomerSegment(BaseModel):
 
 class CustomerPainPoint(BaseModel):
     pain_point: str = Field(
-        description="A specific customer complaint, frustration, or unmet need from the results."
+        description=(
+            "A frustration experienced BY the end customer / buyer "
+            "(e.g. long waits, rude staff, broken app, product quality). "
+            "NOT a problem the business owner or industry faces."
+        )
     )
     source: str = Field(description="URL from the search results backing this pain point.")
+
+
+class OperationalPainPoint(BaseModel):
+    pain_point: str = Field(
+        description=(
+            "A problem the business / industry / operators face "
+            "(e.g. managing phone orders, staff shortages, supply costs, "
+            "inventory waste) that a new venture could solve or should know about. "
+            "NOT an end-customer complaint."
+        )
+    )
+    source: str = Field(
+        description="URL from the search results backing this operational pain point."
+    )
 
 
 class CustomerExtraction(BaseModel):
     customer_segments: list[CustomerSegment] = Field(default_factory=list)
     customer_pain_points: list[CustomerPainPoint] = Field(default_factory=list)
+    operational_pain_points: list[OperationalPainPoint] = Field(default_factory=list)
     no_local_data_reason: str | None = Field(
         default=None,
         description=(
-            "Required when both lists are empty: short explanation that no "
-            "location-specific customer evidence was found."
+            "Required when customer_segments, customer_pain_points, AND "
+            "operational_pain_points are all empty: short explanation that no "
+            "usable evidence was found."
         ),
     )
 
@@ -60,6 +80,7 @@ class CustomerState(TypedDict, total=False):
     needs_search_results: str
     customer_segments: list[dict]
     customer_pain_points: list[dict]
+    operational_pain_points: list[dict]
     confidence: str
     no_local_data_reason: str | None
 
@@ -174,11 +195,12 @@ def extract_customer_insights(state: CustomerState) -> dict:
         location_hint = "general / non-local product or service feedback"
         gate_block = (
             "EVIDENCE GATE (remote / no specific place named):\n"
-            "- Prefer customer reviews, complaints, and needs about this type of "
-            "product or service in general — not a specific city.\n"
-            "- Extract segments and pain points only when the source clearly "
-            "discusses buyers of this kind of offering.\n"
-            "- When ZERO usable items are found, return empty lists and set "
+            "- Prefer reviews, complaints, needs, and operator challenges about "
+            "this type of product or service in general — not a specific city.\n"
+            "- Extract items only when the source clearly discusses this kind of "
+            "offering.\n"
+            "- When ZERO usable items are found across segments, customer pain "
+            "points, and operational pain points, return empty lists and set "
             "no_local_data_reason to a short honest sentence like: "
             f"\"{_REMOTE_NO_CUSTOMER_REASON}\"\n"
             "- Do NOT say \"the stated location\" or invent a city.\n"
@@ -189,18 +211,17 @@ def extract_customer_insights(state: CustomerState) -> dict:
         gate_block = (
             "LOCAL EVIDENCE GATE — mandatory:\n"
             f"- The target location is: {location_hint}.\n"
-            "- ONLY extract a pain_point or customer_segment if the supporting source "
-            "explicitly mentions this location (city/neighborhood/area name) OR clear "
-            "local context (a named local business, local landmark, local market, or "
-            "clearly area-specific forum/review thread).\n"
-            "- If a result is only topically related (generic 'how to start a grocery "
-            "store', national industry blogs, US/UK lifestyle articles, worldwide "
-            "buyer personas) and does NOT name the actual area or local context, "
-            "DO NOT extract it — and do not emit a segment/pain point whose only "
-            "purpose is to explain that the source was irrelevant or off-location.\n"
-            "- When ZERO items pass this gate, return empty customer_segments and "
-            "empty customer_pain_points, set no_local_data_reason to a short honest "
-            "sentence like: \"No customer reviews or discussions specific to "
+            "- ONLY extract a customer_pain_point, operational_pain_point, or "
+            "customer_segment if the supporting source explicitly mentions this "
+            "location (city/neighborhood/area name) OR clear local context "
+            "(a named local business, local landmark, local market, or clearly "
+            "area-specific forum/review thread).\n"
+            "- If a result is only topically related (generic industry blogs, "
+            "national articles, worldwide buyer personas) and does NOT name the "
+            "actual area or local context, DO NOT extract it.\n"
+            "- When ZERO items pass this gate across all three lists, return "
+            "empty lists, set no_local_data_reason to a short honest sentence "
+            "like: \"No customer reviews or discussions specific to "
             f"{location_hint} were found in search results; only generic/non-local "
             "content was available.\", and do not invent fillers.\n"
             "- When at least one item is local, leave no_local_data_reason null.\n\n"
@@ -210,12 +231,31 @@ def extract_customer_insights(state: CustomerState) -> dict:
         "You are a customer-research analyst. From the search results below, extract "
         "customer segments and pain points for this business idea.\n\n"
         f"{gate_block}"
+        "PAIN POINT SPLIT — mandatory (do not mix these):\n"
+        "1) customer_pain_points — ONLY frustrations experienced BY the end "
+        "customer / buyer. Examples that BELONG here: \"I waited too long\", "
+        "\"the app didn't work\", \"staff were rude to me\", \"portions were "
+        "small\", \"delivery arrived cold\". Write from the customer's lived "
+        "experience.\n"
+        "2) operational_pain_points — problems the BUSINESS / industry / "
+        "operators face (not the end buyer). Examples that BELONG here: "
+        "\"restaurants struggle with managing phone orders\", \"shops lose "
+        "money on food waste\", \"owners can't find reliable staff\", "
+        "\"inventory tracking is messy\". These are useful for a new venture "
+        "to solve or watch for — but they are NOT customer complaints.\n"
+        "3) If a sentence describes both, put the buyer-facing frustration in "
+        "customer_pain_points and the operator-facing issue in "
+        "operational_pain_points as separate items (or only the side the source "
+        "actually supports).\n"
+        "4) NEVER put an operator/industry problem into customer_pain_points.\n\n"
         "OTHER RULES:\n"
         "- ONLY extract segments and pain points clearly backed by the search "
-        "results (reviews, complaints, forums, local articles, customer comments).\n"
+        "results (reviews, complaints, forums, local articles, operator "
+        "discussions).\n"
         "- Every segment must include concrete evidence text from the results and "
         "a source URL that appears in the results.\n"
-        "- Every pain point must include a source URL from the results.\n"
+        "- Every customer and operational pain point must include a source URL "
+        "from the results.\n"
         "- Do NOT invent generic personas such as 'young professionals', 'families', "
         "or 'middle-class buyers' unless the search results explicitly support them "
         "with evidence.\n"
@@ -247,8 +287,12 @@ def extract_customer_insights(state: CustomerState) -> dict:
         {"pain_point": item.pain_point, "source": item.source}
         for item in result.customer_pain_points
     ]
+    operational_pain_points = [
+        {"pain_point": item.pain_point, "source": item.source}
+        for item in result.operational_pain_points
+    ]
 
-    if not segments and not pain_points:
+    if not segments and not pain_points and not operational_pain_points:
         reason = (result.no_local_data_reason or "").strip() or _default_no_local_reason(
             location,
             delivery_mode=delivery_mode,
@@ -261,19 +305,21 @@ def extract_customer_insights(state: CustomerState) -> dict:
         return {
             "customer_segments": [],
             "customer_pain_points": [],
+            "operational_pain_points": [],
             "confidence": "none",
             "no_local_data_reason": reason,
         }
 
     source_keys = {
         _normalize_source_key(item["source"])
-        for item in [*segments, *pain_points]
+        for item in [*segments, *pain_points, *operational_pain_points]
         if _normalize_source_key(item.get("source", ""))
     }
 
     return {
         "customer_segments": segments,
         "customer_pain_points": pain_points,
+        "operational_pain_points": operational_pain_points,
         "confidence": _customer_confidence(len(source_keys)),
         "no_local_data_reason": None,
     }
@@ -308,6 +354,7 @@ def run_customer_research(
     return {
         "customer_segments": result.get("customer_segments") or [],
         "customer_pain_points": result.get("customer_pain_points") or [],
+        "operational_pain_points": result.get("operational_pain_points") or [],
         "confidence": result.get("confidence") or "none",
         "no_local_data_reason": result.get("no_local_data_reason"),
     }
@@ -345,6 +392,15 @@ if __name__ == "__main__":
         print("(none)")
     else:
         for i, item in enumerate(pain_points, start=1):
+            print(f"\n[{i}] {item.get('pain_point')}")
+            print(f"    source: {item.get('source')}")
+
+    print("\n=== operational_pain_points ===")
+    operational = output.get("operational_pain_points") or []
+    if not operational:
+        print("(none)")
+    else:
+        for i, item in enumerate(operational, start=1):
             print(f"\n[{i}] {item.get('pain_point')}")
             print(f"    source: {item.get('source')}")
 

@@ -95,12 +95,16 @@ class Strategy(Base):
     positioning: Mapped[str] = mapped_column(Text, nullable=False)
     target_customers: Mapped[str] = mapped_column(Text, nullable=False)
     pricing_strategy: Mapped[str] = mapped_column(Text, nullable=False)
+    estimated_budget: Mapped[str | None] = mapped_column(Text, nullable=True)
     key_differentiators: Mapped[list] = mapped_column(JSON, nullable=False)
     confidence: Mapped[int] = mapped_column(nullable=False)
+    idea_score: Mapped[int | None] = mapped_column(nullable=True)
+    idea_score_label: Mapped[str | None] = mapped_column(String, nullable=True)
     assumptions: Mapped[list] = mapped_column(JSON, nullable=False)
     verification_needed: Mapped[list] = mapped_column(JSON, nullable=False)
     opportunity_tier: Mapped[str | None] = mapped_column(String, nullable=True)
     first_call_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pros_and_cons: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -132,6 +136,9 @@ class CustomerResearch(Base):
     venture_id: Mapped[int] = mapped_column(ForeignKey("ventures.id"), nullable=False)
     customer_segments: Mapped[list] = mapped_column(JSON, nullable=False)
     customer_pain_points: Mapped[list] = mapped_column(JSON, nullable=False)
+    operational_pain_points: Mapped[list] = mapped_column(
+        JSON, nullable=False, server_default=text("'[]'::json")
+    )
     confidence: Mapped[str] = mapped_column(String, nullable=False, server_default="none")
     no_local_data_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -201,6 +208,30 @@ async def create_tables() -> None:
         )
         await conn.execute(
             text(
+                "ALTER TABLE strategies "
+                "ADD COLUMN IF NOT EXISTS estimated_budget TEXT"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE strategies "
+                "ADD COLUMN IF NOT EXISTS idea_score INTEGER"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE strategies "
+                "ADD COLUMN IF NOT EXISTS idea_score_label VARCHAR"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE strategies "
+                "ADD COLUMN IF NOT EXISTS pros_and_cons JSON"
+            )
+        )
+        await conn.execute(
+            text(
                 "ALTER TABLE locations "
                 "ADD COLUMN IF NOT EXISTS data_confidence VARCHAR DEFAULT 'high'"
             )
@@ -221,5 +252,12 @@ async def create_tables() -> None:
             text(
                 "ALTER TABLE customer_research "
                 "ADD COLUMN IF NOT EXISTS no_local_data_reason TEXT"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE customer_research "
+                "ADD COLUMN IF NOT EXISTS operational_pain_points JSON "
+                "DEFAULT '[]'::json"
             )
         )

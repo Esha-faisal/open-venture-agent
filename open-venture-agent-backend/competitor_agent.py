@@ -335,12 +335,62 @@ def _flag_possible_duplicates(findings: list[dict]) -> list[dict]:
     return flagged
 
 
+def _parse_business_idea(business_idea: str) -> tuple[str, str | None]:
+    """Split 'gym in Gulberg, Lahore' into category + location."""
+    match = re.search(r"\bin\s+(.+)$", business_idea, flags=re.IGNORECASE)
+    if match:
+        category = business_idea[: match.start()].strip() or business_idea
+        location = match.group(1).strip()
+        return category, location
+    return business_idea, None
+
+
+_QUERY_FILLER = re.compile(
+    r"\b("
+    r"i\s+want\s+to|i\s+wanna|i'?d\s+like\s+to|looking\s+to|want\s+to|wanna|"
+    r"start|open|build|launch|sell|selling|run|running|create|creating|"
+    r"an?|the|my|our|online|remotely|remote|digital|ecommerce|e-commerce|"
+    r"business|shop|store|venture|idea|company"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _niche_for_query(business_idea: str) -> tuple[str, str]:
+    """Return (niche, place_hint) for competitor search queries."""
+    category, location = _parse_business_idea(business_idea)
+    niche = _QUERY_FILLER.sub(" ", category or business_idea)
+    niche = re.sub(r"[^\w\s&/+-]", " ", niche)
+    niche = re.sub(r"\s+", " ", niche).strip(" -/") or business_idea.strip()
+    place = ""
+    if location:
+        place = re.sub(r"\s+", " ", location.replace(",", " ")).strip()
+    return niche, place
+
+
+def _build_competitor_queries(business_idea: str) -> list[str]:
+    """General web search plus social-platform query for informal sellers."""
+    niche, place = _niche_for_query(business_idea)
+    social_core = f"{niche} {place}".strip() if place else niche
+    return [
+        f"{business_idea} reviews pricing local named competitors",
+        (
+            f"{social_core} site:instagram.com OR site:facebook.com "
+            f"OR site:tiktok.com"
+        ),
+    ]
+
+
 def search_competitors(state: CompetitorState) -> dict:
     tool = TavilySearch(max_results=5)
     business_idea = state["business_idea"]
-    query = f"{business_idea} reviews pricing local named competitors"
-    result = tool.invoke({"query": query})
-    return {"search_results": str(result)}
+    queries = _build_competitor_queries(business_idea)
+    chunks: list[str] = []
+    for query in queries:
+        print(f"[competitor] search query: {query}")
+        result = tool.invoke({"query": query})
+        chunks.append(f"Query: {query}\nResults: {result}")
+    return {"search_results": "\n\n".join(chunks)}
 
 
 def summarize_competitors(state: CompetitorState) -> dict:
@@ -410,6 +460,13 @@ def summarize_competitors(state: CompetitorState) -> dict:
         "Prioritize local and regional rival businesses near the stated location over "
         "well-known international chains — only include global brands as competitors "
         "if they actually operate in that specific area (source must say so).\n\n"
+        "SOCIAL / INFORMAL SELLERS — treat seriously:\n"
+        "- Instagram, Facebook, and TikTok shop/seller pages can be real rivals for "
+        "handmade, home-based, or informal niches. If a social profile clearly sells "
+        "overlapping products to the same market (city/country), classify it as "
+        "category \"competitor\" with the shop/page name.\n"
+        "- Do not dismiss social sellers just because they lack a traditional "
+        "website. Prefer naming the seller/page when the source supports it.\n\n"
         "For each entry, provide:\n"
         "- competitor_name: rival business name, pricing-site label, or vendor name; "
         "MUST be null for directory_source. This field does NOT imply a business "

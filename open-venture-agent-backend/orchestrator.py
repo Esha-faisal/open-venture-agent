@@ -53,6 +53,23 @@ class IdeaValidationResult(BaseModel):
             "business meaning, or too empty to interpret as a venture idea."
         )
     )
+    names_existing_business: bool = Field(
+        description=(
+            "True when the input appears to name a specific, real, already-"
+            "operating company or major brand (e.g. 'Sapphire, Pakistan', "
+            "'Nike store', 'Starbucks in Gulberg') rather than describing a "
+            "new venture type. False for generic concepts like 'a clothing "
+            "shop in Lahore' or when the text clearly frames starting/"
+            "opening/building a NEW business even if a brand is mentioned "
+            "as inspiration."
+        )
+    )
+    existing_business_name: str = Field(
+        description=(
+            "When names_existing_business is true, the short brand/company "
+            "name detected (e.g. 'Sapphire'). Otherwise an empty string."
+        )
+    )
     needs_location: bool = Field(
         description=(
             "True only when this idea would primarily be onsite or hybrid "
@@ -70,10 +87,9 @@ class IdeaValidationResult(BaseModel):
     )
     message: str = Field(
         description=(
-            "When is_valid_idea is false, the invalid-idea explanation. "
-            "When the idea is valid but needs_location is true and "
-            "has_location is false, the missing-location explanation. "
-            "Otherwise an empty string."
+            "Error explanation when a check fails; otherwise an empty string. "
+            "Priority: invalid idea, then existing business, then missing "
+            "location."
         )
     )
 
@@ -87,6 +103,16 @@ _MISSING_LOCATION_MESSAGE = (
     "This looks like a physical/onsite business — please include a city "
     "or area so we can research the local market."
 )
+
+
+def _existing_business_message(brand_name: str) -> str:
+    name = (brand_name or "").strip() or "this brand"
+    return (
+        f"This looks like it might be naming an existing company ({name}) "
+        "rather than describing a new business idea. If you're planning to "
+        "compete with or enter the same market as this brand, try describing "
+        "your own concept instead — e.g. 'a mid-range clothing brand in Lahore.'"
+    )
 
 
 class VentureOrchestratorState(TypedDict, total=False):
@@ -105,6 +131,7 @@ class VentureOrchestratorState(TypedDict, total=False):
     competitor_findings: list[dict]
     customer_segments: list[dict]
     customer_pain_points: list[dict]
+    operational_pain_points: list[dict]
     customer_confidence: str
     no_local_data_reason: str | None
     location_data: dict | None
@@ -114,7 +141,7 @@ class VentureOrchestratorState(TypedDict, total=False):
 
 
 def validate_idea(state: VentureOrchestratorState) -> dict:
-    """Single Gemini check: valid idea + whether a location is required/present."""
+    """Single Gemini check: valid idea, existing brand, and location presence."""
     idea = str(state.get("business_idea") or "").strip()
     if len(idea) < 3:
         return {
@@ -138,16 +165,33 @@ def validate_idea(state: VentureOrchestratorState) -> dict:
         "is clearly a business. False for nonsense, gibberish, random "
         "numbers/characters, keyboard mash, a single meaningless word, "
         "empty/near-empty, or clearly not a business idea.\n\n"
-        "2) needs_location — true ONLY if the idea would primarily be "
+        "2) names_existing_business — true ONLY when the input appears to "
+        "name a specific, real, already-operating company or major brand "
+        "without clear framing that the user is starting/opening/building "
+        "a NEW venture. Examples that SHOULD be true: \"Sapphire, Pakistan\", "
+        "\"Nike\", \"Packages Mall Food Court McDonald's\", \"analyze Daraz\". "
+        "Examples that SHOULD be false: \"a clothing shop in Lahore\", "
+        "\"mid-range apparel brand like Sapphire but for kids in Karachi\", "
+        "\"opening a new cafe near Starbucks in Gulberg\", "
+        "\"compete with Sapphire with a budget clothing line\". "
+        "When true, set existing_business_name to the short brand name "
+        "(e.g. \"Sapphire\"). When false, set existing_business_name to \"\".\n\n"
+        "3) needs_location — true ONLY if the idea would primarily be "
         "onsite or hybrid (physical premises customers visit, or a "
         "meaningful physical + remote mix). False for fully remote/online "
         "businesses (SaaS, online tutoring, dropshipping, etc.).\n\n"
-        "3) has_location — true when the text names a city, town, "
+        "4) has_location — true when the text names a city, town, "
         "neighborhood, district, area, mall, or region (e.g. \"Lahore\", "
         "\"Bahria Town, Islamabad\", \"Packages Mall\", \"Gulberg\"). "
         "False when there is no actionable place name.\n\n"
-        "4) message — set exactly as follows:\n"
+        "5) message — set exactly as follows (first matching rule wins):\n"
         f"- If is_valid_idea is false: \"{_INVALID_INPUT_MESSAGE}\"\n"
+        "- If is_valid_idea is true AND names_existing_business is true: "
+        "\"This looks like it might be naming an existing company "
+        "(<existing_business_name>) rather than describing a new business "
+        "idea. If you're planning to compete with or enter the same market "
+        "as this brand, try describing your own concept instead — e.g. "
+        "'a mid-range clothing brand in Lahore.'\"\n"
         "- If is_valid_idea is true AND needs_location is true AND "
         f"has_location is false: \"{_MISSING_LOCATION_MESSAGE}\"\n"
         "- Otherwise: empty string.\n\n"
@@ -159,7 +203,9 @@ def validate_idea(state: VentureOrchestratorState) -> dict:
     )
 
     is_valid = bool(result.is_valid_idea)
-    needs_location = bool(result.needs_location) if is_valid else False
+    names_existing = bool(result.names_existing_business) if is_valid else False
+    brand_name = (result.existing_business_name or "").strip()
+    needs_location = bool(result.needs_location) if is_valid and not names_existing else False
     has_location = bool(result.has_location)
     message = (result.message or "").strip()
 
@@ -172,6 +218,17 @@ def validate_idea(state: VentureOrchestratorState) -> dict:
             "location_valid": False,
             "location_message": "",
             "status": "invalid_input",
+        }
+
+    if names_existing:
+        return {
+            "input_valid": True,
+            "input_message": message or _existing_business_message(brand_name),
+            "needs_location": False,
+            "has_location": has_location,
+            "location_valid": False,
+            "location_message": "",
+            "status": "existing_business_detected",
         }
 
     if needs_location and not has_location:
@@ -201,9 +258,13 @@ def route_after_validate_idea(
 ) -> Literal["infer_delivery_mode", "end"]:
     if (
         state.get("input_valid") is False
-        or state.get("status") == "invalid_input"
+        or state.get("status")
+        in {
+            "invalid_input",
+            "existing_business_detected",
+            "missing_location",
+        }
         or state.get("location_valid") is False
-        or state.get("status") == "missing_location"
     ):
         return "end"
     return "infer_delivery_mode"
@@ -268,7 +329,10 @@ def run_location(state: VentureOrchestratorState) -> dict:
 
 def research_node(state: VentureOrchestratorState) -> dict:
     """Market research branch — only writes research keys."""
-    research = run_research(state["business_idea"])
+    research = run_research(
+        state["business_idea"],
+        delivery_mode=state.get("delivery_mode"),
+    )
     return {
         "research_findings": list(research.get("findings") or []),
         "hiring_signal": research.get("hiring_signal")
@@ -292,6 +356,7 @@ def customer_node(state: VentureOrchestratorState) -> dict:
     return {
         "customer_segments": customer.get("customer_segments") or [],
         "customer_pain_points": customer.get("customer_pain_points") or [],
+        "operational_pain_points": customer.get("operational_pain_points") or [],
         "customer_confidence": customer.get("confidence") or "none",
         "no_local_data_reason": customer.get("no_local_data_reason"),
     }
@@ -409,6 +474,7 @@ def run_strategy_node(state: VentureOrchestratorState) -> dict:
         state.get("hiring_signal"),
         customer_segments=state.get("customer_segments") or [],
         customer_pain_points=state.get("customer_pain_points") or [],
+        operational_pain_points=state.get("operational_pain_points") or [],
         customer_confidence=state.get("customer_confidence") or "none",
         no_local_data_reason=state.get("no_local_data_reason"),
     )
@@ -431,6 +497,7 @@ def run_final_report(state: VentureOrchestratorState) -> dict:
         "customer_research": {
             "customer_segments": state.get("customer_segments") or [],
             "customer_pain_points": state.get("customer_pain_points") or [],
+            "operational_pain_points": state.get("operational_pain_points") or [],
             "confidence": state.get("customer_confidence") or "none",
             "no_local_data_reason": state.get("no_local_data_reason"),
         },
@@ -501,6 +568,14 @@ def run_venture_pipeline(business_idea: str) -> dict:
                 str(result.get("input_message") or "").strip() or _INVALID_INPUT_MESSAGE
             ),
         }
+    if result.get("status") == "existing_business_detected":
+        return {
+            "status": "existing_business_detected",
+            "message": (
+                str(result.get("input_message") or "").strip()
+                or _existing_business_message("")
+            ),
+        }
     if (
         result.get("status") == "missing_location"
         or result.get("location_valid") is False
@@ -521,6 +596,7 @@ def run_venture_pipeline(business_idea: str) -> dict:
         "competitor_findings": result.get("competitor_findings") or [],
         "customer_segments": result.get("customer_segments") or [],
         "customer_pain_points": result.get("customer_pain_points") or [],
+        "operational_pain_points": result.get("operational_pain_points") or [],
         "customer_confidence": result.get("customer_confidence") or "none",
         "no_local_data_reason": result.get("no_local_data_reason"),
         "location_data": result.get("location_data"),  # may be None for remote
@@ -549,6 +625,8 @@ if __name__ == "__main__":
     print(json.dumps(result.get("customer_segments"), indent=2, ensure_ascii=False))
     print("\n=== customer_pain_points ===")
     print(json.dumps(result.get("customer_pain_points"), indent=2, ensure_ascii=False))
+    print("\n=== operational_pain_points ===")
+    print(json.dumps(result.get("operational_pain_points"), indent=2, ensure_ascii=False))
     print("\n=== customer_confidence ===")
     print(result.get("customer_confidence"))
     print("\n=== no_local_data_reason ===")

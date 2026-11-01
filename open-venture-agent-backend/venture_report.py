@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from gemini_config import GEMINI_MODEL
 from gemini_retry import invoke_with_retry
+from plain_language import PLAIN_LANGUAGE_BLOCK
 from text_sanitize import sanitize_display_text
 
 load_dotenv()
@@ -44,12 +45,14 @@ def _customer_bundle(venture_data: dict) -> dict:
         return {
             "customer_segments": nested.get("customer_segments") or [],
             "customer_pain_points": nested.get("customer_pain_points") or [],
+            "operational_pain_points": nested.get("operational_pain_points") or [],
             "confidence": nested.get("confidence") or "none",
             "no_local_data_reason": nested.get("no_local_data_reason"),
         }
     return {
         "customer_segments": venture_data.get("customer_segments") or [],
         "customer_pain_points": venture_data.get("customer_pain_points") or [],
+        "operational_pain_points": venture_data.get("operational_pain_points") or [],
         "confidence": venture_data.get("customer_confidence") or "none",
         "no_local_data_reason": venture_data.get("no_local_data_reason"),
     }
@@ -316,7 +319,7 @@ def _extract_key_findings(
     Returns:
         {
           market_research, competitors, customer_pain_points,
-          customer_segments, hiring_signal
+          operational_pain_points, customer_segments, hiring_signal
         }
     Each non-empty source contributes its items (specificity-sorted, no
     cross-category crowding or arbitrary global trim).
@@ -360,9 +363,12 @@ def _extract_key_findings(
             competitor_items.append(cleaned)
 
     pain_items: list[str] = []
+    operational_items: list[str] = []
     reason = customer.get("no_local_data_reason")
     has_customer_content = bool(
-        customer.get("customer_segments") or customer.get("customer_pain_points")
+        customer.get("customer_segments")
+        or customer.get("customer_pain_points")
+        or customer.get("operational_pain_points")
     )
     if reason and not has_customer_content:
         pain_items.append(_format_customer_gap_reason(str(reason), delivery_mode))
@@ -370,6 +376,10 @@ def _extract_key_findings(
         pain_text = sanitize_display_text(str(pain.get("pain_point") or "")).strip()
         if pain_text:
             pain_items.append(pain_text)
+    for pain in customer.get("operational_pain_points") or []:
+        pain_text = sanitize_display_text(str(pain.get("pain_point") or "")).strip()
+        if pain_text:
+            operational_items.append(pain_text)
 
     segment_items: list[str] = []
     for segment in customer.get("customer_segments") or []:
@@ -423,6 +433,9 @@ def _extract_key_findings(
         ),
         "customer_pain_points": _filter_category_items(
             pain_items, risks_for_dedupe=risks_for_dedupe
+        ),
+        "operational_pain_points": _filter_category_items(
+            operational_items, risks_for_dedupe=risks_for_dedupe
         ),
         "customer_segments": _filter_category_items(
             segment_items, risks_for_dedupe=risks_for_dedupe
@@ -537,6 +550,7 @@ def _generate_headline(
         "- Mention the business idea and the overall opportunity read "
         "(e.g. promising but contested, unclear, strong, not recommended).\n"
         "- Do not invent facts beyond the inputs.\n\n"
+        f"{PLAIN_LANGUAGE_BLOCK}\n"
         f"Business idea: {venture_data.get('business_idea')}\n"
         f"Delivery mode: {venture_data.get('delivery_mode')}\n"
         f"Opportunity tier: {strategy.get('opportunity_tier')}\n"
@@ -565,6 +579,7 @@ def _recommended_strategy(strategy: dict) -> dict:
         "positioning": strategy.get("positioning") or "",
         "target_customers": strategy.get("target_customers") or "",
         "pricing_strategy": strategy.get("pricing_strategy") or "",
+        "estimated_budget": strategy.get("estimated_budget") or "",
         "key_differentiators": [str(item) for item in differentiators],
     }
 
@@ -599,6 +614,7 @@ def _analysis_research_bundle(venture_data: dict) -> dict:
         "customer_research": {
             "customer_segments": customer.get("customer_segments") or [],
             "customer_pain_points": customer.get("customer_pain_points") or [],
+            "operational_pain_points": customer.get("operational_pain_points") or [],
             "confidence": customer.get("confidence"),
             "no_local_data_reason": customer.get("no_local_data_reason"),
         },
@@ -622,6 +638,7 @@ def _analysis_research_bundle(venture_data: dict) -> dict:
             "positioning": strategy.get("positioning"),
             "target_customers": strategy.get("target_customers"),
             "pricing_strategy": strategy.get("pricing_strategy"),
+            "estimated_budget": strategy.get("estimated_budget"),
             "key_differentiators": strategy.get("key_differentiators") or [],
             "assumptions": strategy.get("assumptions") or [],
             "verification_needed": strategy.get("verification_needed") or [],
@@ -722,6 +739,8 @@ def generate_final_report(venture_data: dict) -> dict:
         "headline": headline,
         "opportunity_tier": strategy.get("opportunity_tier"),
         "confidence": strategy.get("confidence"),
+        "idea_score": strategy.get("idea_score"),
+        "idea_score_label": strategy.get("idea_score_label"),
         "recommended_strategy": recommended_strategy,
         "key_findings": key_findings,
         "top_risks": top_risks,

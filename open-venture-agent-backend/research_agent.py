@@ -60,6 +60,7 @@ class HiringExtraction(BaseModel):
 
 class ResearchState(TypedDict, total=False):
     business_idea: str
+    delivery_mode: str | None
     search_results: str
     hiring_search_results: str
     hiring_query: str
@@ -85,8 +86,130 @@ def _parse_business_idea(business_idea: str) -> tuple[str, str | None]:
     return business_idea, None
 
 
-def _build_market_queries(business_idea: str) -> list[str]:
-    """Short, direct queries that favor local listings over industry reports."""
+_FILLER_WORDS = re.compile(
+    r"\b("
+    r"i\s+want\s+to|i\s+wanna|i'?d\s+like\s+to|looking\s+to|want\s+to|wanna|"
+    r"start|open|build|launch|sell|selling|run|running|create|creating|"
+    r"an?|the|my|our|online|remotely|remote|digital|ecommerce|e-commerce|"
+    r"business|shop|store|venture|idea|company"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+# Country/region → display name + primary online sales channels.
+# Keep channel names searchable on Tavily (no Boolean OR).
+_ONLINE_MARKETS: list[tuple[re.Pattern[str], str, list[str]]] = [
+    (
+        re.compile(r"\bpakistan\b|\bpk\b", re.I),
+        "Pakistan",
+        ["Daraz", "Instagram"],
+    ),
+    (
+        re.compile(r"\bindia\b", re.I),
+        "India",
+        ["Amazon India", "Flipkart", "Instagram"],
+    ),
+    (
+        re.compile(r"\bbangladesh\b", re.I),
+        "Bangladesh",
+        ["Daraz", "Instagram"],
+    ),
+    (
+        re.compile(r"\b(?:uae|united arab emirates|dubai)\b", re.I),
+        "UAE",
+        ["Amazon", "Noon", "Instagram"],
+    ),
+    (
+        re.compile(r"\b(?:saudi arabia|ksa)\b", re.I),
+        "Saudi Arabia",
+        ["Noon", "Instagram"],
+    ),
+    (
+        re.compile(r"\b(?:united kingdom|\buk\b|england)\b", re.I),
+        "UK",
+        ["Etsy", "Amazon UK", "eBay"],
+    ),
+    (
+        re.compile(r"\b(?:united states|\busa\b|\bus\b|america)\b", re.I),
+        "USA",
+        ["Etsy", "Amazon", "Shopify"],
+    ),
+    (
+        re.compile(r"\bcanada\b", re.I),
+        "Canada",
+        ["Etsy", "Amazon", "Shopify"],
+    ),
+    (
+        re.compile(r"\baustralia\b", re.I),
+        "Australia",
+        ["Etsy", "Amazon", "Instagram"],
+    ),
+]
+
+
+def _clean_niche(text: str) -> str:
+    """Strip conversational filler so queries stay product/niche-focused."""
+    cleaned = _FILLER_WORDS.sub(" ", text or "")
+    cleaned = re.sub(r"[^\w\s&/+-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -/")
+    return cleaned or (text or "").strip()
+
+
+def _infer_online_market(*texts: str | None) -> tuple[str | None, list[str]]:
+    """Return (country_label, marketplace channels) from idea/location text."""
+    blob = " ".join(t for t in texts if t)
+    if not blob:
+        return None, ["Etsy", "Amazon", "Instagram"]
+    for pattern, label, channels in _ONLINE_MARKETS:
+        if pattern.search(blob):
+            return label, channels
+    return None, ["Etsy", "Amazon", "Instagram", "Shopify"]
+
+
+def _build_remote_market_queries(business_idea: str) -> list[str]:
+    """Niche + real online channels — not vague '[product] market [country]'."""
+    category, location = _parse_business_idea(business_idea)
+    niche = _clean_niche(category)
+    market, channels = _infer_online_market(location, business_idea)
+    if market:
+        niche = re.sub(re.escape(market), " ", niche, flags=re.IGNORECASE)
+        niche = re.sub(r"\s+", " ", niche).strip(" -/") or _clean_niche(category)
+
+    primary = channels[0]
+    # Prefer a social/commerce seller channel for the second query.
+    social = "Instagram"
+    for candidate in channels:
+        if re.search(r"instagram|tiktok|etsy", candidate, re.I):
+            social = candidate
+            break
+
+    if market:
+        seller_niche = (
+            niche
+            if re.search(r"\b(handmade|handcrafted|custom)\b", niche, re.I)
+            else f"handmade {niche}"
+        )
+        return [
+            f"{niche} {primary} {market} pricing",
+            f"{seller_niche} {social} sellers {market}",
+            f"{market} ecommerce shipping COD challenges {niche}",
+        ]
+
+    return [
+        f"{niche} {primary} online pricing demand",
+        f"{niche} {social} sellers online shop",
+        f"ecommerce shipping challenges selling {niche} online",
+    ]
+
+
+def _build_market_queries(
+    business_idea: str,
+    delivery_mode: str | None = None,
+) -> list[str]:
+    """Short, direct queries — local for onsite; niche+channels for remote."""
+    if (delivery_mode or "").lower() == "remote":
+        return _build_remote_market_queries(business_idea)
+
     category, location = _parse_business_idea(business_idea)
     if location:
         place = location.replace(",", " ")
@@ -99,12 +222,23 @@ def _build_market_queries(business_idea: str) -> list[str]:
     return [f"{business_idea} market competition demand"]
 
 
-def _build_hiring_query(business_idea: str) -> str:
+def _build_hiring_query(
+    business_idea: str,
+    delivery_mode: str | None = None,
+) -> str:
     """
     Natural-language hiring query (no Boolean OR).
     Boolean operators often confuse Tavily and return empty/irrelevant hits.
     """
     category, location = _parse_business_idea(business_idea)
+    if (delivery_mode or "").lower() == "remote":
+        niche = _clean_niche(category)
+        market, _ = _infer_online_market(location, business_idea)
+        if market:
+            niche = re.sub(re.escape(market), " ", niche, flags=re.IGNORECASE)
+            niche = re.sub(r"\s+", " ", niche).strip(" -/") or _clean_niche(category)
+            return f"{niche} ecommerce online seller jobs hiring {market}"
+        return f"{niche} ecommerce online seller jobs hiring remote"
     if location:
         place = location.replace(",", " ")
         place = re.sub(r"\s+", " ", place).strip()
@@ -114,7 +248,8 @@ def _build_hiring_query(business_idea: str) -> str:
 
 def search_market(state: ResearchState) -> dict:
     tool = TavilySearch(max_results=5)
-    queries = _build_market_queries(state["business_idea"])
+    delivery_mode = state.get("delivery_mode")
+    queries = _build_market_queries(state["business_idea"], delivery_mode)
     chunks: list[str] = []
     for query in queries:
         print(f"[research] market search query: {query}")
@@ -125,7 +260,8 @@ def search_market(state: ResearchState) -> dict:
 
 def search_hiring(state: ResearchState) -> dict:
     tool = TavilySearch(max_results=8)
-    query = _build_hiring_query(state["business_idea"])
+    delivery_mode = state.get("delivery_mode")
+    query = _build_hiring_query(state["business_idea"], delivery_mode)
     print(f"[research] hiring search query: {query}")
     result = tool.invoke({"query": query})
     return {
@@ -140,18 +276,44 @@ def summarize_findings(state: ResearchState) -> dict:
     hiring_llm = llm.with_structured_output(HiringExtraction)
 
     _, location = _parse_business_idea(state["business_idea"])
-    location_hint = location or "the stated location in the business idea"
+    delivery_mode = (state.get("delivery_mode") or "").lower() or None
+    is_remote = delivery_mode == "remote"
+
+    if is_remote:
+        location_hint = "the online / ecommerce market for this niche"
+        focus_block = (
+            "produce 3-5 concise findings focused on this PRODUCT NICHE in "
+            "online sales channels (marketplaces, social commerce, ecommerce "
+            "pricing, shipping/COD, seller competition). Prefer evidence about "
+            "the specific product type and real platforms over vague "
+            "country-level industry statistics. If a country or region is "
+            "named in the idea, use it only as the online market context — "
+            "not as a physical neighborhood study.\n"
+        )
+        hiring_focus = (
+            "online/ecommerce sellers, marketplace operators, and remote or "
+            "digital roles related to this product niche"
+        )
+    else:
+        location_hint = location or "the stated location in the business idea"
+        focus_block = (
+            "produce 3-5 concise findings focused on the SPECIFIC location "
+            f"({location_hint}). Prefer city/neighborhood/regional data over "
+            "global industry statistics. Only use worldwide figures when no "
+            "local or regional data appears in the results — and if you must, "
+            "clearly label them as global, not local.\n"
+            "If a search hit is clearly about a different city/region than "
+            f"{location_hint}, omit it entirely — do not include a finding that "
+            "only explains why that source is irrelevant.\n"
+        )
+        hiring_focus = (
+            "this business category or nearby businesses of the same type "
+            f"(location focus: {location_hint})"
+        )
 
     findings_prompt = (
         "You are a market research analyst. From the search results below, "
-        "produce 3-5 concise findings focused on the SPECIFIC location "
-        f"({location_hint}). Prefer city/neighborhood/regional data over "
-        "global industry statistics. Only use worldwide figures when no "
-        "local or regional data appears in the results — and if you must, "
-        "clearly label them as global, not local.\n"
-        "If a search hit is clearly about a different city/region than "
-        f"{location_hint}, omit it entirely — do not include a finding that "
-        "only explains why that source is irrelevant.\n"
+        f"{focus_block}"
         "Each finding must include a short 'finding' insight and a 'source' URL "
         "taken from the search results.\n\n"
         "EVIDENCE DISCIPLINE — follow exactly:\n"
@@ -180,7 +342,8 @@ def summarize_findings(state: ResearchState) -> dict:
         "signal.\"\n"
         "4. \"One directory lists three bakeries in the neighborhood — useful "
         "as a snapshot of who is open, not a full competitive census.\"\n\n"
-        f"Business idea: {state['business_idea']}\n\n"
+        f"Business idea: {state['business_idea']}\n"
+        f"Delivery mode: {delivery_mode or 'unknown'}\n\n"
         f"Search results:\n{state['search_results']}"
     )
     findings_result = invoke_with_retry(
@@ -189,13 +352,13 @@ def summarize_findings(state: ResearchState) -> dict:
     )
 
     hiring_prompt = (
-        "You are analyzing job/hiring signals for a local business opportunity. "
+        "You are analyzing job/hiring signals for a business opportunity. "
         "From the hiring search results below, extract job postings related to "
-        "this business category or nearby businesses of the same type "
-        f"(location focus: {location_hint}). "
-        "Include gym/fitness/hospitality/retail staff roles when relevant. "
-        "Be inclusive: if a posting is in the same city/area and same industry, "
-        "include it.\n\n"
+        f"{hiring_focus}. "
+        "Include gym/fitness/hospitality/retail staff roles when relevant for "
+        "onsite ideas; for remote/online ideas prefer ecommerce, marketplace, "
+        "fulfillment, customer support, and digital seller roles. "
+        "Be inclusive: if a posting matches the niche and market, include it.\n\n"
         "For EVERY posting, return structured fields — never one blended sentence:\n"
         "- role: the job title / role name only (e.g. \"Event Manager\", "
         "\"Baker\", \"Fitness Trainer\").\n"
@@ -258,8 +421,16 @@ def build_research_graph():
 research_agent = build_research_graph()
 
 
-def run_research(business_idea: str) -> dict:
-    result = research_agent.invoke({"business_idea": business_idea})
+def run_research(
+    business_idea: str,
+    delivery_mode: str | None = None,
+) -> dict:
+    result = research_agent.invoke(
+        {
+            "business_idea": business_idea,
+            "delivery_mode": delivery_mode,
+        }
+    )
     # Research findings are finding + source only — never competitor_name.
     findings = []
     for item in result.get("findings") or []:
@@ -285,6 +456,11 @@ if __name__ == "__main__":
     idea = "gym in Gulberg, Lahore"
     print("Market queries:", _build_market_queries(idea))
     print("Hiring query:", _build_hiring_query(idea))
+
+    remote_idea = "handmade crochet products online Pakistan"
+    print("\nRemote market queries:", _build_market_queries(remote_idea, "remote"))
+    print("Remote hiring query:", _build_hiring_query(remote_idea, "remote"))
+
     result = run_research(idea)
     print("Findings:")
     for item in result["findings"]:

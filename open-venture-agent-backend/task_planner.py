@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from gemini_config import GEMINI_MODEL
 from gemini_retry import invoke_with_retry
+from plain_language import PLAIN_LANGUAGE_BLOCK
 
 load_dotenv()
 
@@ -136,6 +137,9 @@ def _build_tasks_from_differentiators(
         "that logically should finish before building this differentiator.\n"
         "- If unsure which validate tasks apply, depend on all of them.\n"
         "- differentiator_index is 0-based into the differentiators list.\n\n"
+        f"{PLAIN_LANGUAGE_BLOCK}\n"
+        "Task titles must follow the plain-language rules above — a shop owner "
+        "should understand the title immediately.\n\n"
         f"Key differentiators:\n{json.dumps(differentiators, indent=2)}\n\n"
         f"Validate tasks:\n{json.dumps(validate_summary, indent=2)}"
     )
@@ -207,6 +211,9 @@ def _validation_titles_from_verification_needed(
         "since map density and named research disagree.\"\n"
         "- Do not invent unrelated work; stay tightly tied to the concern.\n"
         "- Do not start with \"Verify that…\" restating the risk as a belief.\n\n"
+        f"{PLAIN_LANGUAGE_BLOCK}\n"
+        "Task titles must follow the plain-language rules above — everyday words "
+        "a shop owner understands immediately.\n\n"
         f"Verification / risk statements:\n{json.dumps(verification_items, indent=2)}"
     )
 
@@ -256,6 +263,9 @@ def _validation_titles_from_assumptions(assumptions: list[str]) -> list[str]:
         "currently struggle to find locally').\n"
         "- The action must test whether the assumption is true — not assert it.\n"
         "- Do not invent unrelated work; stay tightly tied to what the assumption claims.\n\n"
+        f"{PLAIN_LANGUAGE_BLOCK}\n"
+        "Task titles must follow the plain-language rules above — everyday words "
+        "a shop owner understands immediately.\n\n"
         f"Assumptions:\n{json.dumps(assumptions, indent=2)}"
     )
 
