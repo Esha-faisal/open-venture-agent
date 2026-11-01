@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -31,9 +32,11 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+
 app.add_middleware(
     CORSMiddleware,
-    # Vite may bind 5173, 5174, etc. — accept any localhost / 127.0.0.1 port in dev.
+    allow_origins=[frontend_url] if frontend_url else [],
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
@@ -59,7 +62,14 @@ class MissingLocationResponse(BaseModel):
     message: str
 
 
-EarlyExitResponse = InvalidInputResponse | MissingLocationResponse
+class ExistingBusinessResponse(BaseModel):
+    status: Literal["existing_business_detected"] = "existing_business_detected"
+    message: str
+
+
+EarlyExitResponse = (
+    InvalidInputResponse | MissingLocationResponse | ExistingBusinessResponse
+)
 
 
 class FindingResponse(BaseModel):
@@ -105,16 +115,31 @@ class LocationResponse(BaseModel):
     note: str | None = None
 
 
+class ProsConsItemResponse(BaseModel):
+    point: str = ""
+    reasoning: str = ""
+    source: str = ""
+
+
+class ProsAndConsResponse(BaseModel):
+    pros: list[ProsConsItemResponse] = []
+    cons: list[ProsConsItemResponse] = []
+
+
 class StrategyResponse(BaseModel):
     positioning: str
     target_customers: str
     pricing_strategy: str
+    estimated_budget: str | None = None
     key_differentiators: list[str]
     confidence: int
+    idea_score: int | None = None
+    idea_score_label: str | None = None
     assumptions: list[str]
     verification_needed: list[str]
     opportunity_tier: str | None = None
     first_call_question: str | None = None
+    pros_and_cons: ProsAndConsResponse | None = None
 
 
 class HiringPostingResponse(BaseModel):
@@ -144,6 +169,7 @@ class CustomerPainPointResponse(BaseModel):
 class CustomerResearchResponse(BaseModel):
     customer_segments: list[CustomerSegmentResponse] = []
     customer_pain_points: list[CustomerPainPointResponse] = []
+    operational_pain_points: list[CustomerPainPointResponse] = []
     confidence: str = "none"
     no_local_data_reason: str | None = None
 
@@ -186,6 +212,7 @@ class RecommendedStrategyResponse(BaseModel):
     positioning: str = ""
     target_customers: str = ""
     pricing_strategy: str = ""
+    estimated_budget: str = ""
     key_differentiators: list[str] = []
 
 
@@ -193,6 +220,7 @@ class KeyFindingsResponse(BaseModel):
     market_research: list[str] = []
     competitors: list[str] = []
     customer_pain_points: list[str] = []
+    operational_pain_points: list[str] = []
     customer_segments: list[str] = []
     hiring_signal: list[str] = []
 
@@ -201,6 +229,8 @@ class FinalReportResponse(BaseModel):
     headline: str
     opportunity_tier: str | None = None
     confidence: int | None = None
+    idea_score: int | None = None
+    idea_score_label: str | None = None
     recommended_strategy: RecommendedStrategyResponse | None = None
     key_findings: KeyFindingsResponse = Field(default_factory=KeyFindingsResponse)
     top_risks: list[str] = []
@@ -327,6 +357,40 @@ def _location_response_from_model(location: Location | None) -> LocationResponse
     )
 
 
+def _pros_and_cons_response(raw) -> ProsAndConsResponse | None:
+    if not isinstance(raw, dict):
+        return None
+
+    def _items(key: str) -> list[ProsConsItemResponse]:
+        items: list[ProsConsItemResponse] = []
+        for item in raw.get(key) or []:
+            if isinstance(item, dict):
+                point = sanitize_display_text(str(item.get("point") or "")).strip()
+                reasoning = sanitize_display_text(
+                    str(item.get("reasoning") or "")
+                ).strip()
+                source = sanitize_display_text(str(item.get("source") or "")).strip()
+                if point or reasoning:
+                    items.append(
+                        ProsConsItemResponse(
+                            point=point,
+                            reasoning=reasoning,
+                            source=source,
+                        )
+                    )
+            else:
+                text = sanitize_display_text(str(item or "")).strip()
+                if text:
+                    items.append(ProsConsItemResponse(point=text, reasoning="", source=""))
+        return items
+
+    pros = _items("pros")
+    cons = _items("cons")
+    if not pros and not cons:
+        return None
+    return ProsAndConsResponse(pros=pros, cons=cons)
+
+
 def _strategy_response_from_data(data: dict | None) -> StrategyResponse | None:
     if data is None:
         return None
@@ -334,12 +398,16 @@ def _strategy_response_from_data(data: dict | None) -> StrategyResponse | None:
         positioning=data["positioning"],
         target_customers=data["target_customers"],
         pricing_strategy=data["pricing_strategy"],
+        estimated_budget=data.get("estimated_budget") or None,
         key_differentiators=data["key_differentiators"],
         confidence=data["confidence"],
+        idea_score=data.get("idea_score"),
+        idea_score_label=data.get("idea_score_label"),
         assumptions=data["assumptions"],
         verification_needed=data["verification_needed"],
         opportunity_tier=data.get("opportunity_tier"),
         first_call_question=data.get("first_call_question"),
+        pros_and_cons=_pros_and_cons_response(data.get("pros_and_cons")),
     )
 
 
@@ -350,12 +418,16 @@ def _strategy_response_from_model(strategy: Strategy | None) -> StrategyResponse
         positioning=strategy.positioning,
         target_customers=strategy.target_customers,
         pricing_strategy=strategy.pricing_strategy,
+        estimated_budget=strategy.estimated_budget,
         key_differentiators=strategy.key_differentiators,
         confidence=strategy.confidence,
+        idea_score=strategy.idea_score,
+        idea_score_label=strategy.idea_score_label,
         assumptions=strategy.assumptions,
         verification_needed=strategy.verification_needed,
         opportunity_tier=strategy.opportunity_tier,
         first_call_question=strategy.first_call_question,
+        pros_and_cons=_pros_and_cons_response(strategy.pros_and_cons),
     )
 
 
@@ -406,11 +478,13 @@ def _customer_research_response(
     *,
     segments: list[dict] | None = None,
     pain_points: list[dict] | None = None,
+    operational_pain_points: list[dict] | None = None,
     confidence: str | None = None,
     no_local_data_reason: str | None = None,
 ) -> CustomerResearchResponse | None:
     segments = segments or []
     pain_points = pain_points or []
+    operational_pain_points = operational_pain_points or []
     conf = confidence or "none"
     return CustomerResearchResponse(
         customer_segments=[
@@ -429,6 +503,13 @@ def _customer_research_response(
             )
             for item in pain_points
         ],
+        operational_pain_points=[
+            CustomerPainPointResponse(
+                pain_point=item.get("pain_point") or "",
+                source=item.get("source") or "",
+            )
+            for item in operational_pain_points
+        ],
         confidence=conf,
         no_local_data_reason=no_local_data_reason,
     )
@@ -442,6 +523,7 @@ def _customer_research_response_from_model(
     return _customer_research_response(
         segments=row.customer_segments or [],
         pain_points=row.customer_pain_points or [],
+        operational_pain_points=getattr(row, "operational_pain_points", None) or [],
         confidence=row.confidence,
         no_local_data_reason=row.no_local_data_reason,
     )
@@ -452,6 +534,7 @@ def _save_customer_research(
     *,
     segments: list[dict],
     pain_points: list[dict],
+    operational_pain_points: list[dict] | None = None,
     confidence: str,
     no_local_data_reason: str | None = None,
 ) -> CustomerResearch:
@@ -459,6 +542,7 @@ def _save_customer_research(
         venture_id=venture_id,
         customer_segments=segments,
         customer_pain_points=pain_points,
+        operational_pain_points=operational_pain_points or [],
         confidence=confidence or "none",
         no_local_data_reason=no_local_data_reason,
     )
@@ -485,12 +569,16 @@ def _save_strategy(venture_id: int, data: dict) -> Strategy:
         positioning=data["positioning"],
         target_customers=data["target_customers"],
         pricing_strategy=data["pricing_strategy"],
+        estimated_budget=data.get("estimated_budget") or None,
         key_differentiators=data["key_differentiators"],
         confidence=data["confidence"],
+        idea_score=data.get("idea_score"),
+        idea_score_label=data.get("idea_score_label"),
         assumptions=data["assumptions"],
         verification_needed=data["verification_needed"],
         opportunity_tier=data.get("opportunity_tier"),
         first_call_question=data.get("first_call_question"),
+        pros_and_cons=data.get("pros_and_cons"),
     )
 
 
@@ -523,6 +611,9 @@ def _key_findings_response(raw) -> KeyFindingsResponse:
             customer_pain_points=_sanitize_finding_list(
                 raw.get("customer_pain_points")
             ),
+            operational_pain_points=_sanitize_finding_list(
+                raw.get("operational_pain_points")
+            ),
             customer_segments=_sanitize_finding_list(raw.get("customer_segments")),
             hiring_signal=_sanitize_finding_list(raw.get("hiring_signal")),
         )
@@ -546,6 +637,9 @@ def _final_report_response(data: dict | None) -> FinalReportResponse | None:
             pricing_strategy=sanitize_display_text(
                 recommended.get("pricing_strategy") or ""
             ),
+            estimated_budget=sanitize_display_text(
+                recommended.get("estimated_budget") or ""
+            ),
             key_differentiators=[
                 sanitize_display_text(str(item))
                 for item in (recommended.get("key_differentiators") or [])
@@ -556,6 +650,11 @@ def _final_report_response(data: dict | None) -> FinalReportResponse | None:
         headline=sanitize_display_text(data.get("headline") or ""),
         opportunity_tier=data.get("opportunity_tier"),
         confidence=data.get("confidence"),
+        idea_score=data.get("idea_score"),
+        idea_score_label=(
+            sanitize_display_text(str(data.get("idea_score_label") or "").strip())
+            or None
+        ),
         recommended_strategy=recommended_response,
         key_findings=_key_findings_response(data.get("key_findings")),
         top_risks=[
@@ -643,6 +742,17 @@ async def create_venture(
                 )
             )
         )
+    if pipeline.get("status") == "existing_business_detected":
+        return ExistingBusinessResponse(
+            message=str(
+                pipeline.get("message")
+                or (
+                    "This looks like it might be naming an existing company rather "
+                    "than describing a new business idea. Try describing your own "
+                    "concept instead — e.g. 'a mid-range clothing brand in Lahore.'"
+                )
+            )
+        )
     if pipeline.get("status") == "missing_location":
         return MissingLocationResponse(
             message=str(
@@ -673,6 +783,7 @@ async def create_venture(
     task_plan = pipeline.get("task_plan") or []
     customer_segments = pipeline.get("customer_segments") or []
     customer_pain_points = pipeline.get("customer_pain_points") or []
+    operational_pain_points = pipeline.get("operational_pain_points") or []
     customer_confidence = pipeline.get("customer_confidence") or "none"
     no_local_data_reason = pipeline.get("no_local_data_reason")
     final_report = pipeline.get("final_report")
@@ -723,6 +834,7 @@ async def create_venture(
                 venture.id,
                 segments=customer_segments,
                 pain_points=customer_pain_points,
+                operational_pain_points=operational_pain_points,
                 confidence=customer_confidence,
                 no_local_data_reason=no_local_data_reason,
             )
@@ -779,6 +891,7 @@ async def create_venture(
         customer_research=_customer_research_response(
             segments=customer_segments,
             pain_points=customer_pain_points,
+            operational_pain_points=operational_pain_points,
             confidence=customer_confidence,
             no_local_data_reason=no_local_data_reason,
         ),
